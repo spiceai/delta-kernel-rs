@@ -47,7 +47,7 @@ struct AddRemoveDedupVisitor<'seen> {
     is_log_batch: bool,
 }
 
-impl<'seen> AddRemoveDedupVisitor<'seen> {
+impl AddRemoveDedupVisitor<'_> {
     /// Checks if log replay already processed this logical file (in which case the current action
     /// should be ignored). If not already seen, register it so we can recognize future duplicates.
     fn check_and_record_seen(&mut self, key: FileActionKey) -> bool {
@@ -107,7 +107,7 @@ impl<'seen> AddRemoveDedupVisitor<'seen> {
     }
 }
 
-impl<'seen> RowVisitor for AddRemoveDedupVisitor<'seen> {
+impl RowVisitor for AddRemoveDedupVisitor<'_> {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         // NOTE: The visitor assumes a schema with adds first and removes optionally afterward.
         static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
@@ -180,7 +180,8 @@ pub(crate) static SCAN_ROW_SCHEMA: LazyLock<Arc<StructType>> = LazyLock::new(|| 
     ]))
 });
 
-static SCAN_ROW_DATATYPE: LazyLock<DataType> = LazyLock::new(|| SCAN_ROW_SCHEMA.clone().into());
+pub(crate) static SCAN_ROW_DATATYPE: LazyLock<DataType> =
+    LazyLock::new(|| SCAN_ROW_SCHEMA.clone().into());
 
 fn get_add_transform_expr() -> Expression {
     Expression::Struct(vec![
@@ -195,13 +196,9 @@ fn get_add_transform_expr() -> Expression {
 
 impl LogReplayScanner {
     /// Create a new [`LogReplayScanner`] instance
-    fn new(
-        engine: &dyn Engine,
-        table_schema: &SchemaRef,
-        predicate: Option<ExpressionRef>,
-    ) -> Self {
+    fn new(engine: &dyn Engine, physical_predicate: Option<(ExpressionRef, SchemaRef)>) -> Self {
         Self {
-            filter: DataSkippingFilter::new(engine, table_schema, predicate),
+            filter: DataSkippingFilter::new(engine, physical_predicate),
             seen: Default::default(),
         }
     }
@@ -241,10 +238,9 @@ impl LogReplayScanner {
 pub fn scan_action_iter(
     engine: &dyn Engine,
     action_iter: impl Iterator<Item = DeltaResult<(Box<dyn EngineData>, bool)>>,
-    table_schema: &SchemaRef,
-    predicate: Option<ExpressionRef>,
+    physical_predicate: Option<(ExpressionRef, SchemaRef)>,
 ) -> impl Iterator<Item = DeltaResult<ScanData>> {
-    let mut log_scanner = LogReplayScanner::new(engine, table_schema, predicate);
+    let mut log_scanner = LogReplayScanner::new(engine, physical_predicate);
     let add_transform = engine.get_expression_handler().get_evaluator(
         get_log_add_schema().clone(),
         get_add_transform_expr(),

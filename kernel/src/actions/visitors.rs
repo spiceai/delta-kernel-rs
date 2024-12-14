@@ -5,8 +5,7 @@ use std::collections::HashMap;
 use std::sync::LazyLock;
 
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
-use crate::expressions::{column_name, ColumnName};
-use crate::schema::{ColumnNamesAndTypes, DataType};
+use crate::schema::{column_name, ColumnName, ColumnNamesAndTypes, DataType};
 use crate::utils::require;
 use crate::{DeltaResult, Error};
 
@@ -122,7 +121,7 @@ struct ProtocolVisitor {
 
 impl ProtocolVisitor {
     #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
-    fn visit_protocol<'a>(
+    pub(crate) fn visit_protocol<'a>(
         row_index: usize,
         min_reader_version: i32,
         getters: &[&'a dyn GetData<'a>],

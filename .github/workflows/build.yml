@@ -41,6 +41,34 @@ jobs:
           cargo msrv --path derive-macros/ verify --all-features
           cargo msrv --path ffi/ verify --all-features
           cargo msrv --path ffi-proc-macros/ verify --all-features
+  msrv-run-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install minimal stable and cargo msrv
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: default
+          toolchain: stable
+          override: true
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-msrv
+        shell: bash
+        run: |
+          cargo install cargo-msrv --locked
+      - name: Get rust-version from Cargo.toml
+        id: rust-version
+        run: echo "RUST_VERSION=$(cargo msrv show --path kernel/ --output-format minimal)" >> $GITHUB_ENV
+      - name: Install specified rust version
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          profile: minimal
+      - name: run tests
+        run: |
+          pushd kernel
+          echo "Testing with $(cargo msrv show --output-format minimal)"
+          cargo +$(cargo msrv show --output-format minimal) test
   docs:
     runs-on: ubuntu-latest
     env:
@@ -145,7 +173,7 @@ jobs:
           cargo build
           popd
           pushd ffi
-          cargo b --features default-engine,sync-engine,test-ffi
+          cargo b --features default-engine,sync-engine,test-ffi,tracing
           popd
       - name: build and run read-table test
         run: |
@@ -177,7 +205,7 @@ jobs:
       - name: Test with Miri
         run: |
           pushd ffi
-          MIRIFLAGS=-Zmiri-disable-isolation cargo miri test --features sync-engine
+          MIRIFLAGS=-Zmiri-disable-isolation cargo miri test --features sync-engine,default-engine
 
   coverage:
     runs-on: ubuntu-latest

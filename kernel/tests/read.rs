@@ -56,20 +56,20 @@ async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>>
         .await?;
 
     let location = Url::parse("memory:///")?;
-    let engine = DefaultEngine::new(
+    let engine = Arc::new(DefaultEngine::new(
         storage.clone(),
         Path::from("/"),
         Arc::new(TokioBackgroundExecutor::new()),
-    );
+    ));
 
     let table = Table::new(location);
     let expected_data = vec![batch.clone(), batch];
 
-    let snapshot = table.snapshot(&engine, None)?;
+    let snapshot = table.snapshot(engine.as_ref(), None)?;
     let scan = snapshot.into_scan_builder().build()?;
 
     let mut files = 0;
-    let stream = scan.execute(&engine)?.zip(expected_data);
+    let stream = scan.execute(engine)?.zip(expected_data);
 
     for (data, expected) in stream {
         let raw_data = data?.raw_data?;
@@ -126,7 +126,7 @@ async fn two_commits() -> Result<(), Box<dyn std::error::Error>> {
     let scan = snapshot.into_scan_builder().build()?;
 
     let mut files = 0;
-    let stream = scan.execute(&engine)?.zip(expected_data);
+    let stream = scan.execute(Arc::new(engine))?.zip(expected_data);
 
     for (data, expected) in stream {
         let raw_data = data?.raw_data?;
@@ -183,7 +183,7 @@ async fn remove_action() -> Result<(), Box<dyn std::error::Error>> {
     let snapshot = table.snapshot(&engine, None)?;
     let scan = snapshot.into_scan_builder().build()?;
 
-    let stream = scan.execute(&engine)?.zip(expected_data);
+    let stream = scan.execute(Arc::new(engine))?.zip(expected_data);
 
     let mut files = 0;
     for (data, expected) in stream {
@@ -247,14 +247,14 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     let location = Url::parse("memory:///").unwrap();
-    let engine = DefaultEngine::new(
+    let engine = Arc::new(DefaultEngine::new(
         storage.clone(),
         Path::from(""),
         Arc::new(TokioBackgroundExecutor::new()),
-    );
+    ));
 
     let table = Table::new(location);
-    let snapshot = Arc::new(table.snapshot(&engine, None)?);
+    let snapshot = Arc::new(table.snapshot(engine.as_ref(), None)?);
 
     // The first file has id between 1 and 3; the second has id between 5 and 7. For each operator,
     // we validate the boundary values where we expect the set of matched files to change.
@@ -306,7 +306,7 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
 
         let expected_files = expected_batches.len();
         let mut files_scanned = 0;
-        let stream = scan.execute(&engine)?.zip(expected_batches);
+        let stream = scan.execute(engine.clone())?.zip(expected_batches);
 
         for (batch, expected) in stream {
             let raw_data = batch?.raw_data?;
@@ -318,35 +318,8 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-macro_rules! sort_lines {
-    ($lines: expr) => {{
-        // sort except for header + footer
-        let num_lines = $lines.len();
-        if num_lines > 3 {
-            $lines.as_mut_slice()[2..num_lines - 1].sort_unstable()
-        }
-    }};
-}
-
-// NB: expected_lines_sorted MUST be pre-sorted (via sort_lines!())
-macro_rules! assert_batches_sorted_eq {
-    ($expected_lines_sorted: expr, $CHUNKS: expr) => {
-        let formatted = arrow::util::pretty::pretty_format_batches($CHUNKS)
-            .unwrap()
-            .to_string();
-        // fix for windows: \r\n -->
-        let mut actual_lines: Vec<&str> = formatted.trim().lines().collect();
-        sort_lines!(actual_lines);
-        assert_eq!(
-            $expected_lines_sorted, actual_lines,
-            "\n\nexpected:\n\n{:#?}\nactual:\n\n{:#?}\n\n",
-            $expected_lines_sorted, actual_lines
-        );
-    };
-}
-
 fn read_with_execute(
-    engine: &dyn Engine,
+    engine: Arc<dyn Engine>,
     scan: &Scan,
     expected: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -416,8 +389,8 @@ fn read_with_scan_data(
             .get_parquet_handler()
             .read_parquet_files(
                 &[meta],
-                global_state.read_schema.clone(),
-                scan.predicate().clone(),
+                global_state.physical_schema.clone(),
+                scan.physical_predicate().clone(),
             )
             .unwrap();
 
@@ -472,10 +445,10 @@ fn read_table_data(
     )?;
     let sync_engine = delta_kernel::engine::sync::SyncEngine::new();
 
-    let engines: &[&dyn Engine] = &[&sync_engine, &default_engine];
-    for &engine in engines {
+    let engines: Vec<Arc<dyn Engine>> = vec![Arc::new(sync_engine), Arc::new(default_engine)];
+    for engine in engines {
         let table = Table::new(url.clone());
-        let snapshot = table.snapshot(engine, None)?;
+        let snapshot = table.snapshot(engine.as_ref(), None)?;
 
         let read_schema = select_cols.map(|select_cols| {
             let table_schema = snapshot.schema();
@@ -484,6 +457,7 @@ fn read_table_data(
                 .map(|col| table_schema.field(col).cloned().unwrap());
             Arc::new(Schema::new(selected_fields))
         });
+        println!("Read {url:?} with schema {read_schema:#?} and predicate {predicate:#?}");
         let scan = snapshot
             .into_scan_builder()
             .with_schema_opt(read_schema)
@@ -491,8 +465,8 @@ fn read_table_data(
             .build()?;
 
         sort_lines!(expected);
+        read_with_scan_data(table.location(), engine.as_ref(), &scan, &expected)?;
         read_with_execute(engine, &scan, &expected)?;
-        read_with_scan_data(table.location(), engine, &scan, &expected)?;
     }
     Ok(())
 }
@@ -852,6 +826,10 @@ fn invalid_skips_none_predicates() -> Result<(), Box<dyn std::error::Error>> {
     let cases = vec![
         (Expression::literal(false), table_for_numbers(vec![])),
         (
+            Expression::and(column_expr!("number"), false),
+            table_for_numbers(vec![]),
+        ),
+        (
             Expression::literal(true),
             table_for_numbers(vec![1, 2, 3, 4, 5, 6]),
         ),
@@ -1041,17 +1019,17 @@ fn predicate_references_invalid_missing_column() -> Result<(), Box<dyn std::erro
     //    "+--------+",
     //    "+--------+",
     //];
-    let columns = &["chrono"];
+    let columns = &["chrono", "missing"];
     let expected = vec![
-        "+-------------------------------------------------------------------------------------------+",
-        "| chrono                                                                                    |",
-        "+-------------------------------------------------------------------------------------------+",
-        "| {date32: 1971-01-01, timestamp: 1970-02-01T08:00:00Z, timestamp_ntz: 1970-01-02T00:00:00} |",
-        "| {date32: 1971-01-02, timestamp: 1970-02-01T09:00:00Z, timestamp_ntz: 1970-01-02T00:01:00} |",
-        "| {date32: 1971-01-03, timestamp: 1970-02-01T10:00:00Z, timestamp_ntz: 1970-01-02T00:02:00} |",
-        "| {date32: 1971-01-04, timestamp: 1970-02-01T11:00:00Z, timestamp_ntz: 1970-01-02T00:03:00} |",
-        "| {date32: 1971-01-05, timestamp: 1970-02-01T12:00:00Z, timestamp_ntz: 1970-01-02T00:04:00} |",
-        "+-------------------------------------------------------------------------------------------+",
+        "+-------------------------------------------------------------------------------------------+---------+",
+        "| chrono                                                                                    | missing |",
+        "+-------------------------------------------------------------------------------------------+---------+",
+        "| {date32: 1971-01-01, timestamp: 1970-02-01T08:00:00Z, timestamp_ntz: 1970-01-02T00:00:00} |         |",
+        "| {date32: 1971-01-02, timestamp: 1970-02-01T09:00:00Z, timestamp_ntz: 1970-01-02T00:01:00} |         |",
+        "| {date32: 1971-01-03, timestamp: 1970-02-01T10:00:00Z, timestamp_ntz: 1970-01-02T00:02:00} |         |",
+        "| {date32: 1971-01-04, timestamp: 1970-02-01T11:00:00Z, timestamp_ntz: 1970-01-02T00:03:00} |         |",
+        "| {date32: 1971-01-05, timestamp: 1970-02-01T12:00:00Z, timestamp_ntz: 1970-01-02T00:04:00} |         |",
+        "+-------------------------------------------------------------------------------------------+---------+",
     ];
     let predicate = column_expr!("missing").lt(10i64);
     read_table_data_str(
@@ -1080,6 +1058,7 @@ fn predicate_references_invalid_missing_column() -> Result<(), Box<dyn std::erro
         Some(columns),
         Some(predicate),
         expected,
-    )?;
+    )
+    .expect_err("unknown column");
     Ok(())
 }
