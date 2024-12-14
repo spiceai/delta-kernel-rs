@@ -188,6 +188,10 @@ pub enum Error {
 
     #[error("Change data feed is unsupported for the table at version {0}")]
     ChangeDataFeedUnsupported(Version),
+
+    /// Invalid checkpoint files
+    #[error("Invalid Checkpoint: {0}")]
+    InvalidCheckpoint(String),
 }
 
 // Convenience constructors for Error types that take a String argument
@@ -253,6 +257,10 @@ impl Error {
     }
     pub fn change_data_feed_unsupported(version: impl Into<Version>) -> Self {
         Self::ChangeDataFeedUnsupported(version.into())
+    }
+
+    pub fn invalid_checkpoint(msg: impl ToString) -> Self {
+        Self::InvalidCheckpoint(msg.to_string())
     }
 
     // Capture a backtrace when the error is constructed.
