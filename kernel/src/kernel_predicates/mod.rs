@@ -843,20 +843,23 @@ pub trait DataSkippingPredicateEvaluator {
     ) -> Option<Self::Output> {
         let max = self.get_max_stat(col, &val.data_type())?;
 
-        // Delta Lake min/max stats are stored with millisecond precision (truncated, not rounded up),
-        // so we need to adjust timestamp values by subtracting 999 microseconds from the value to ensure
-        // that comparisons against max stats are correct. 
-        // Any rows that pass this filter will be re-evaluated later for exact matches.
+        // Delta Lake min/max stats are stored with millisecond precision (truncated, not rounded up) so we can't use direct comparison.
+        // For Ordering::Greater comparison we adjust timestamp values by subtracting 999 microseconds from the value to ensure
+        // that comparisons against max stats are correct. Any rows that pass this filter will be re-evaluated later for exact matches.
         // See:
         // - https://github.com/delta-io/delta-kernel-rs/issues/1002
         // - https://github.com/delta-io/delta-kernel-rs/pull/1003
+        if matches!(val, Scalar::Timestamp(_) | Scalar::TimestampNtz(_)) {
+            if !inverted && ord == Ordering::Greater {
+                let max_ts_adjusted = timestamp_subtract(val, 999);
+                tracing::debug!(
+                "Adjusted timestamp value for col {col} for max stat comparison from {val:?} to {max_ts_adjusted:?}"
+                );
+                return self.eval_partial_cmp(ord, max, &max_ts_adjusted, inverted);
+            }
 
-        if !inverted && ord == Ordering::Greater && matches!(val, Scalar::Timestamp(_) | Scalar::TimestampNtz(_)) {
-            let max_ts_adjusted = timestamp_subtract(val, 999);
-            tracing::debug!(
-               "Adjusted timestamp value for col {col} for max stat comparison from {val:?} to {max_ts_adjusted:?}"
-            );
-            return self.eval_partial_cmp(ord, max, &max_ts_adjusted, inverted);
+            // Disabled by default: https://github.com/delta-io/delta-kernel-rs/issues/1002
+            return None;
         }
 
         self.eval_partial_cmp(ord, max, val, inverted)
@@ -1004,16 +1007,11 @@ impl<T: DataSkippingPredicateEvaluator + ?Sized> KernelPredicateEvaluator for T 
     }
 }
 
-
 /// Adjust timestamp value by subtracting the given interval in microseconds.
 fn timestamp_subtract(val: &Scalar, interval_micros: i64) -> Scalar {
     match val {
-        Scalar::Timestamp(ts) => {
-            Scalar::Timestamp(*ts - interval_micros)
-        },
-        Scalar::TimestampNtz(ts) => {
-            Scalar::TimestampNtz(*ts - interval_micros)
-        },
+        Scalar::Timestamp(ts) => Scalar::Timestamp(*ts - interval_micros),
+        Scalar::TimestampNtz(ts) => Scalar::TimestampNtz(*ts - interval_micros),
         _ => val.clone(),
     }
 }
