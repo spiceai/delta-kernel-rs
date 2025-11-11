@@ -26,3 +26,23 @@ repository = "https://github.com/delta-io/delta-kernel-rs"
 readme = "README.md"
 rust-version = "1.84"
 version = "0.16.0"
+
+[patch.crates-io]
+arrow = { git = "https://github.com/spiceai/arrow-rs.git", rev = "bfada495edbfc6ddcdabd3d2d93ac6e013552acd" }        # spiceai-56
+arrow-arith = { git = "https://github.com/spiceai/arrow-rs.git", rev = "bfada495edbfc6ddcdabd3d2d93ac6e013552acd" }  # spiceai-56
+arrow-array = { git = "https://github.com/spiceai/arrow-rs.git", rev = "bfada495edbfc6ddcdabd3d2d93ac6e013552acd" }  # spiceai-56
+arrow-buffer = { git = "https://github.com/spiceai/arrow-rs.git", rev = "bfada495edbfc6ddcdabd3d2d93ac6e013552acd" } # spiceai-56
+arrow-cast = { git = "https://github.com/spiceai/arrow-rs.git", rev = "bfada495edbfc6ddcdabd3d2d93ac6e013552acd" }   # spiceai-56
+arrow-csv = { git = "https://github.com/spiceai/arrow-rs.git", rev = "bfada495edbfc6ddcdabd3d2d93ac6e013552acd" }    # spiceai-56
+arrow-data = { git = "https://github.com/spiceai/arrow-rs.git", rev = "bfada495edbfc6ddcdabd3d2d93ac6e013552acd" }   # spiceai-56
+arrow-ipc = { git = "https://github.com/spiceai/arrow-rs.git", rev = "bfada495edbfc6ddcdabd3d2d93ac6e013552acd" }    # spiceai-56
+arrow-json = { git = "https://github.com/spiceai/arrow-rs.git", rev = "bfada495edbfc6ddcdabd3d2d93ac6e013552acd" }   # spiceai-56
+arrow-ord = { git = "https://github.com/spiceai/arrow-rs.git", rev = "bfada495edbfc6ddcdabd3d2d93ac6e013552acd" }    # spiceai-56
+arrow-row = { git = "https://github.com/spiceai/arrow-rs.git", rev = "bfada495edbfc6ddcdabd3d2d93ac6e013552acd" }    # spiceai-56
+arrow-schema = { git = "https://github.com/spiceai/arrow-rs.git", rev = "bfada495edbfc6ddcdabd3d2d93ac6e013552acd" } # spiceai-56
+arrow-select = { git = "https://github.com/spiceai/arrow-rs.git", rev = "bfada495edbfc6ddcdabd3d2d93ac6e013552acd" } # spiceai-56
+arrow-string = { git = "https://github.com/spiceai/arrow-rs.git", rev = "bfada495edbfc6ddcdabd3d2d93ac6e013552acd" } # spiceai-56
+parquet = { git = "https://github.com/spiceai/arrow-rs.git", rev = "bfada495edbfc6ddcdabd3d2d93ac6e013552acd" }      # spiceai-56
+
+# Use same object_store ref as spiceai-56
+object_store = { git = "https://github.com/apache/arrow-rs-object-store", rev = "f0a772cd49d2ebb1f19f487ccd93d705f48dc891" }

@@ -1,9 +1,5 @@
 //! Default Parquet handler implementation
 
-use std::collections::HashMap;
-use std::ops::Range;
-use std::sync::Arc;
-
 use crate::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
 use crate::arrow::array::{BooleanArray, Int64Array, RecordBatch, StringArray, StructArray};
 use crate::arrow::datatypes::{DataType, Field};
@@ -12,9 +8,13 @@ use crate::parquet::arrow::arrow_reader::{
 };
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
+use chrono::DateTime;
 use futures::StreamExt;
 use object_store::path::Path;
-use object_store::DynObjectStore;
+use object_store::{DynObjectStore, ObjectMeta};
+use std::collections::HashMap;
+use std::ops::Range;
+use std::sync::Arc;
 use uuid::Uuid;
 
 use super::file_stream::{FileOpenFuture, FileOpener, FileStream};
@@ -289,6 +289,23 @@ impl FileOpener for ParquetOpener {
         Ok(Box::pin(async move {
             let mut reader = {
                 use object_store::ObjectStoreScheme;
+
+                let Some(last_modified) = DateTime::from_timestamp_millis(file_meta.last_modified)
+                else {
+                    return Err(Error::generic(format!(
+                        "Unable to convert FileMeta last modified time: {}",
+                        file_meta.last_modified
+                    )));
+                };
+
+                let object_meta = ObjectMeta {
+                    location: Path::from_url_path(file_meta.location.path())?,
+                    last_modified,
+                    size: file_meta.size,
+                    e_tag: None,
+                    version: None,
+                };
+
                 // HACK: unfortunately, `ParquetObjectReader` under the hood does a suffix range
                 // request which isn't supported by Azure. For now we just detect if the URL is
                 // pointing to azure and if so, do a HEAD request so we can pass in file size to the
@@ -306,7 +323,7 @@ impl FileOpener for ParquetOpener {
                     let meta = store.head(&path).await?;
                     ParquetObjectReader::new(store, path).with_file_size(meta.size)
                 } else {
-                    ParquetObjectReader::new(store, path)
+                    ParquetObjectReader::new_with_meta(store, object_meta)
                 }
             };
 
