@@ -35,7 +35,6 @@ arrow-buffer = { git = "https://github.com/spiceai/arrow-rs.git", rev = "bfada49
 arrow-cast = { git = "https://github.com/spiceai/arrow-rs.git", rev = "bfada495edbfc6ddcdabd3d2d93ac6e013552acd" }   # spiceai-56
 arrow-csv = { git = "https://github.com/spiceai/arrow-rs.git", rev = "bfada495edbfc6ddcdabd3d2d93ac6e013552acd" }    # spiceai-56
 arrow-data = { git = "https://github.com/spiceai/arrow-rs.git", rev = "bfada495edbfc6ddcdabd3d2d93ac6e013552acd" }   # spiceai-56
-arrow-flight = { git = "https://github.com/spiceai/arrow-rs.git", rev = "bfada495edbfc6ddcdabd3d2d93ac6e013552acd" } # spiceai-56
 arrow-ipc = { git = "https://github.com/spiceai/arrow-rs.git", rev = "bfada495edbfc6ddcdabd3d2d93ac6e013552acd" }    # spiceai-56
 arrow-json = { git = "https://github.com/spiceai/arrow-rs.git", rev = "bfada495edbfc6ddcdabd3d2d93ac6e013552acd" }   # spiceai-56
 arrow-ord = { git = "https://github.com/spiceai/arrow-rs.git", rev = "bfada495edbfc6ddcdabd3d2d93ac6e013552acd" }    # spiceai-56
