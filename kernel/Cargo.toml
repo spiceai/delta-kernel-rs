@@ -81,12 +81,12 @@ optional = true
 # arrow 56
 [dependencies.arrow_56]
 package = "arrow"
-version = "56"
+version = "=56.0.0"
 features = ["chrono-tz", "ffi", "json", "prettyprint"]
 optional = true
 [dependencies.parquet_56]
 package = "parquet"
-version = "56"
+version = "=56.0.0"
 features = ["async", "object_store"]
 optional = true
 
