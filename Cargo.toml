@@ -28,3 +28,19 @@ repository = "https://github.com/delta-io/delta-kernel-rs"
 readme = "README.md"
 rust-version = "1.85"
 version = "0.17.0"
+
+[patch.crates-io]
+# Use spiceai arrow-rs fork with new_with_meta API
+arrow = { git = "https://github.com/spiceai/arrow-rs.git", branch = "spiceai-57" }
+arrow-array = { git = "https://github.com/spiceai/arrow-rs.git", branch = "spiceai-57" }
+arrow-buffer = { git = "https://github.com/spiceai/arrow-rs.git", branch = "spiceai-57" }
+arrow-cast = { git = "https://github.com/spiceai/arrow-rs.git", branch = "spiceai-57" }
+arrow-data = { git = "https://github.com/spiceai/arrow-rs.git", branch = "spiceai-57" }
+arrow-ipc = { git = "https://github.com/spiceai/arrow-rs.git", branch = "spiceai-57" }
+arrow-json = { git = "https://github.com/spiceai/arrow-rs.git", branch = "spiceai-57" }
+arrow-ord = { git = "https://github.com/spiceai/arrow-rs.git", branch = "spiceai-57" }
+arrow-row = { git = "https://github.com/spiceai/arrow-rs.git", branch = "spiceai-57" }
+arrow-schema = { git = "https://github.com/spiceai/arrow-rs.git", branch = "spiceai-57" }
+arrow-select = { git = "https://github.com/spiceai/arrow-rs.git", branch = "spiceai-57" }
+arrow-string = { git = "https://github.com/spiceai/arrow-rs.git", branch = "spiceai-57" }
+parquet = { git = "https://github.com/spiceai/arrow-rs.git", branch = "spiceai-57" }
