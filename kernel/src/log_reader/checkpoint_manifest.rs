@@ -41,7 +41,7 @@ impl CheckpointManifestReader {
         manifest: &ParsedLogPath,
         log_root: Url,
     ) -> DeltaResult<Self> {
-        static MANIFEST_READ_SCHMEA: LazyLock<SchemaRef> = LazyLock::new(|| {
+        static MANIFEST_READ_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
             Arc::new(StructType::new_unchecked([
                 StructField::nullable(ADD_NAME, Add::to_schema()),
                 StructField::nullable(REMOVE_NAME, Remove::to_schema()),
@@ -52,12 +52,12 @@ impl CheckpointManifestReader {
         let actions = match manifest.extension.as_str() {
             "json" => engine.json_handler().read_json_files(
                 std::slice::from_ref(&manifest.location),
-                MANIFEST_READ_SCHMEA.clone(),
+                MANIFEST_READ_SCHEMA.clone(),
                 None,
             )?,
             "parquet" => engine.parquet_handler().read_parquet_files(
                 std::slice::from_ref(&manifest.location),
-                MANIFEST_READ_SCHMEA.clone(),
+                MANIFEST_READ_SCHEMA.clone(),
                 None,
             )?,
             extension => {
