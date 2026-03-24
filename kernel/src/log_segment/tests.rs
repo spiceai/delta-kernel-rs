@@ -1043,7 +1043,7 @@ fn test_checkpoint_batch_with_sidecar_files_that_do_not_exist() -> DeltaResult<(
 
     // Assert that an error is returned when trying to read sidecar files that do not exist
     let err = iter.next().unwrap();
-    assert_result_error_with_message(err, "Arrow error: External: Object at location _delta_log/_sidecars/sidecarfile1.parquet not found: No data in memory found. Location: _delta_log/_sidecars/sidecarfile1.parquet");
+    assert_result_error_with_message(err, "not found");
 
     Ok(())
 }
