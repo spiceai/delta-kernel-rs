@@ -27,7 +27,7 @@ license = "Apache-2.0"
 repository = "https://github.com/delta-io/delta-kernel-rs"
 readme = "README.md"
 rust-version = "1.85"
-version = "0.18.2"
+version = "0.19.2"
 
 [patch.crates-io]
 # Use spiceai arrow-rs fork with new_with_meta API

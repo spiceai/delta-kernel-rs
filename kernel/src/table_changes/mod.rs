@@ -40,8 +40,9 @@ use crate::log_segment::LogSegment;
 use crate::path::AsUrl;
 use crate::schema::{DataType, Schema, StructField, StructType};
 use crate::snapshot::{Snapshot, SnapshotRef};
-use crate::table_properties::TableProperties;
-use crate::utils::require;
+use crate::table_configuration::TableConfiguration;
+use crate::table_features::Operation;
+use crate::table_features::TableFeature;
 use crate::{DeltaResult, Engine, Error, Version};
 
 mod log_replay;
@@ -112,6 +113,7 @@ pub struct TableChanges {
     end_snapshot: SnapshotRef,
     start_version: Version,
     schema: Schema,
+    start_table_config: TableConfiguration,
 }
 
 impl TableChanges {
@@ -144,46 +146,33 @@ impl TableChanges {
             end_version,
         )?;
 
-        // Both snapshots ensure that reading is supported at the start and end version using
-        // `ensure_read_supported`. Note that we must still verify that reading is
-        // supported for every protocol action in the CDF range.
         let start_snapshot = Snapshot::builder_for(table_root.as_url().clone())
             .at_version(start_version)
             .build(engine)?;
+        start_snapshot
+            .table_configuration()
+            .ensure_operation_supported(Operation::Cdf)?;
+
         let end_snapshot = match end_version {
             Some(version) => Snapshot::builder_from(start_snapshot.clone())
                 .at_version(version)
                 .build(engine)?,
             None => Snapshot::builder_from(start_snapshot.clone()).build(engine)?,
         };
-
-        // we block reading catalog-managed tables with CDF for now. note this is best-effort just
-        // checking that start/end snapshots are not catalog-managed.
-        //
-        // TODO: link issue
-        #[cfg(feature = "catalog-managed")]
-        require!(
-            !start_snapshot
-                .table_configuration()
-                .protocol()
-                .is_catalog_managed()
-                && !end_snapshot
-                    .table_configuration()
-                    .protocol()
-                    .is_catalog_managed(),
-            Error::unsupported("Change data feed is not supported for catalog-managed tables")
-        );
+        end_snapshot
+            .table_configuration()
+            .ensure_operation_supported(Operation::Cdf)?;
 
         // Verify CDF is enabled at the beginning and end of the interval using
         // [`check_cdf_table_properties`] to fail early. This also ensures that column mapping is
         // disabled.
         //
-        // We also check the [`Protocol`] using [`ensure_cdf_read_supported`] to verify that
-        // we support CDF with those features enabled.
-        //
         // Note: We must still check each metadata and protocol action in the CDF range.
         let check_table_config = |snapshot: &Snapshot| {
-            if snapshot.table_configuration().is_cdf_read_supported() {
+            if snapshot
+                .table_configuration()
+                .is_feature_enabled(&TableFeature::ChangeDataFeed)
+            {
                 Ok(())
             } else {
                 Err(Error::change_data_feed_unsupported(snapshot.version()))
@@ -216,6 +205,7 @@ impl TableChanges {
             log_segment,
             start_version,
             schema,
+            start_table_config: start_snapshot.table_configuration().clone(),
         })
     }
 
@@ -247,17 +237,6 @@ impl TableChanges {
     pub fn into_scan_builder(self) -> TableChangesScanBuilder {
         TableChangesScanBuilder::new(self)
     }
-}
-
-/// Ensures that change data feed is enabled in `table_properties`. See the documentation
-/// of [`TableChanges`] for more details.
-// TODO: move to TableProperties and normalize with the check in TableConfiguration
-fn check_cdf_table_properties(table_properties: &TableProperties) -> DeltaResult<()> {
-    require!(
-        table_properties.enable_change_data_feed.unwrap_or(false),
-        Error::unsupported("Change data feed is not enabled")
-    );
-    Ok(())
 }
 
 #[cfg(test)]

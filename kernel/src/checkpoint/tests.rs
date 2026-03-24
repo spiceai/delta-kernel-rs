@@ -11,15 +11,20 @@ use crate::arrow::{
     datatypes::Field,
 };
 use crate::checkpoint::create_last_checkpoint_data;
+use crate::committer::FileSystemCommitter;
 use crate::engine::arrow_data::ArrowEngineData;
+use crate::engine::default::executor::tokio::TokioMultiThreadExecutor;
 use crate::engine::default::DefaultEngine;
+use crate::engine_data::FilteredEngineData;
 use crate::log_replay::HasSelectionVector;
 use crate::schema::{DataType as KernelDataType, StructField, StructType};
 use crate::utils::test_utils::Action;
-use crate::{DeltaResult, FileMeta, LogPath, Snapshot};
+use crate::{DeltaResult, Engine, EngineData, FileMeta, LogPath, Snapshot, SnapshotRef};
 
+use object_store::local::LocalFileSystem;
 use object_store::{memory::InMemory, path::Path, ObjectStore};
 use serde_json::{from_slice, json, Value};
+use tempfile::tempdir;
 use test_utils::delta_path_for_version;
 use url::Url;
 
@@ -56,8 +61,8 @@ fn test_deleted_file_retention_timestamp() -> DeltaResult<()> {
     Ok(())
 }
 
-#[test]
-fn test_create_checkpoint_metadata_batch() -> DeltaResult<()> {
+#[tokio::test]
+async fn test_create_checkpoint_metadata_batch() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
     let engine = DefaultEngine::new(store.clone());
 
@@ -70,7 +75,8 @@ fn test_create_checkpoint_metadata_batch() -> DeltaResult<()> {
             create_metadata_action(),
         ],
         0,
-    )?;
+    )
+    .await?;
 
     let table_root = Url::parse("memory:///")?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
@@ -169,7 +175,7 @@ fn new_in_memory_store() -> (Arc<InMemory>, Url) {
 /// TODO(#855): Merge copies and move to `test_utils`
 /// Writes all actions to a _delta_log json commit file in the store.
 /// This function formats the provided filename into the _delta_log directory.
-fn write_commit_to_store(
+async fn write_commit_to_store(
     store: &Arc<InMemory>,
     actions: Vec<Action>,
     version: u64,
@@ -179,13 +185,8 @@ fn write_commit_to_store(
         .map(|action| serde_json::to_string(&action).expect("action to string"))
         .collect();
     let content = json_lines.join("\n");
-
     let commit_path = delta_path_for_version(version, "json");
-
-    tokio::runtime::Runtime::new()
-        .expect("create tokio runtime")
-        .block_on(async { store.put(&commit_path, content.into()).await })?;
-
+    store.put(&commit_path, content.into()).await?;
     Ok(())
 }
 
@@ -241,14 +242,14 @@ fn create_remove_action(path: &str) -> Action {
 }
 
 /// Helper to verify the contents of the `_last_checkpoint` file
-fn assert_last_checkpoint_contents(
+async fn assert_last_checkpoint_contents(
     store: &Arc<InMemory>,
     expected_version: u64,
     expected_size: u64,
     expected_num_add_files: u64,
     expected_size_in_bytes: u64,
 ) -> DeltaResult<()> {
-    let last_checkpoint_data = read_last_checkpoint_file(store)?;
+    let last_checkpoint_data = read_last_checkpoint_file(store).await?;
     let expected_data = json!({
         "version": expected_version,
         "size": expected_size,
@@ -260,26 +261,52 @@ fn assert_last_checkpoint_contents(
 }
 
 /// Reads the `_last_checkpoint` file from storage
-fn read_last_checkpoint_file(store: &Arc<InMemory>) -> DeltaResult<Value> {
+async fn read_last_checkpoint_file(store: &Arc<InMemory>) -> DeltaResult<Value> {
     let path = Path::from("_delta_log/_last_checkpoint");
-    let rt = tokio::runtime::Runtime::new().expect("create tokio runtime");
-    let byte_data = rt.block_on(async {
-        let data = store.get(&path).await?;
-        data.bytes().await
-    })?;
+    let data = store.get(&path).await?;
+    let byte_data = data.bytes().await?;
     Ok(from_slice(&byte_data)?)
+}
+
+/// Performs a full checkpoint write for the given snapshot.
+fn do_checkpoint<E: Engine>(snapshot: SnapshotRef, engine: &E) -> DeltaResult<()> {
+    let writer = snapshot.checkpoint()?;
+    let checkpoint_path = writer.checkpoint_path()?;
+
+    // Get checkpoint data iterator and consume it while collecting filtered batches
+    let mut data_iter = writer.checkpoint_data(engine)?;
+    let mut filtered_batches: Vec<Box<dyn EngineData>> = Vec::new();
+    for batch_result in data_iter.by_ref() {
+        let filtered_data: FilteredEngineData = batch_result?;
+        if filtered_data.has_selected_rows() {
+            filtered_batches.push(filtered_data.apply_selection_vector()?);
+        }
+    }
+
+    // Write the checkpoint data to parquet
+    let batches_iter: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send> =
+        Box::new(filtered_batches.into_iter().map(Ok));
+    engine
+        .parquet_handler()
+        .write_parquet_file(checkpoint_path.clone(), batches_iter)?;
+
+    // Get file metadata (size) from storage and finalize
+    let metadata = engine.storage_handler().head(&checkpoint_path)?;
+    writer.finalize(engine, &metadata, data_iter)?;
+
+    Ok(())
 }
 
 /// Tests the `checkpoint()` API with:
 /// - A table that does not support v2Checkpoint
 /// - No version specified (latest version is used)
-#[test]
-fn test_v1_checkpoint_latest_version_by_default() -> DeltaResult<()> {
+#[tokio::test]
+async fn test_v1_checkpoint_latest_version_by_default() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
     let engine = DefaultEngine::new(store.clone());
 
     // 1st commit: adds `fake_path_1`
-    write_commit_to_store(&store, vec![create_add_action("fake_path_1")], 0)?;
+    write_commit_to_store(&store, vec![create_add_action("fake_path_1")], 0).await?;
 
     // 2nd commit: adds `fake_path_2` & removes `fake_path_1`
     write_commit_to_store(
@@ -289,7 +316,8 @@ fn test_v1_checkpoint_latest_version_by_default() -> DeltaResult<()> {
             create_remove_action("fake_path_1"),
         ],
         1,
-    )?;
+    )
+    .await?;
 
     // 3rd commit: metadata & protocol actions
     // Protocol action does not include the v2Checkpoint reader/writer feature.
@@ -297,7 +325,8 @@ fn test_v1_checkpoint_latest_version_by_default() -> DeltaResult<()> {
         &store,
         vec![create_metadata_action(), create_basic_protocol_action()],
         2,
-    )?;
+    )
+    .await?;
 
     let table_root = Url::parse("memory:///")?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
@@ -335,7 +364,7 @@ fn test_v1_checkpoint_latest_version_by_default() -> DeltaResult<()> {
     // - size: 1 metadata + 1 protocol + 1 add action + 1 remove action
     // - numOfAddFiles: 1 add file from 2nd commit (fake_path_2)
     // - sizeInBytes: passed to finalize (10)
-    assert_last_checkpoint_contents(&store, 2, 4, 1, size_in_bytes)?;
+    assert_last_checkpoint_contents(&store, 2, 4, 1, size_in_bytes).await?;
 
     Ok(())
 }
@@ -343,8 +372,8 @@ fn test_v1_checkpoint_latest_version_by_default() -> DeltaResult<()> {
 /// Tests the `checkpoint()` API with:
 /// - A table that does not support v2Checkpoint
 /// - A specific version specified (version 0)
-#[test]
-fn test_v1_checkpoint_specific_version() -> DeltaResult<()> {
+#[tokio::test]
+async fn test_v1_checkpoint_specific_version() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
     let engine = DefaultEngine::new(store.clone());
 
@@ -354,7 +383,8 @@ fn test_v1_checkpoint_specific_version() -> DeltaResult<()> {
         &store,
         vec![create_basic_protocol_action(), create_metadata_action()],
         0,
-    )?;
+    )
+    .await?;
 
     // 2nd commit (version 1) - add actions
     write_commit_to_store(
@@ -364,7 +394,8 @@ fn test_v1_checkpoint_specific_version() -> DeltaResult<()> {
             create_add_action("file2.parquet"),
         ],
         1,
-    )?;
+    )
+    .await?;
 
     let table_root = Url::parse("memory:///")?;
     // Specify version 0 for checkpoint
@@ -400,13 +431,13 @@ fn test_v1_checkpoint_specific_version() -> DeltaResult<()> {
     // - size: 1 metadata + 1 protocol
     // - numOfAddFiles: no add files in version 0
     // - sizeInBytes: passed to finalize (10)
-    assert_last_checkpoint_contents(&store, 0, 2, 0, size_in_bytes)?;
+    assert_last_checkpoint_contents(&store, 0, 2, 0, size_in_bytes).await?;
 
     Ok(())
 }
 
-#[test]
-fn test_finalize_errors_if_checkpoint_data_iterator_is_not_exhausted() -> DeltaResult<()> {
+#[tokio::test]
+async fn test_finalize_errors_if_checkpoint_data_iterator_is_not_exhausted() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
     let engine = DefaultEngine::new(store.clone());
 
@@ -415,7 +446,8 @@ fn test_finalize_errors_if_checkpoint_data_iterator_is_not_exhausted() -> DeltaR
         &store,
         vec![create_basic_protocol_action(), create_metadata_action()],
         0,
-    )?;
+    )
+    .await?;
 
     let table_root = Url::parse("memory:///")?;
     let snapshot = Snapshot::builder_for(table_root)
@@ -447,8 +479,8 @@ fn test_finalize_errors_if_checkpoint_data_iterator_is_not_exhausted() -> DeltaR
 /// Tests the `checkpoint()` API with:
 /// - A table that does supports v2Checkpoint
 /// - No version specified (latest version is used)
-#[test]
-fn test_v2_checkpoint_supported_table() -> DeltaResult<()> {
+#[tokio::test]
+async fn test_v2_checkpoint_supported_table() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
     let engine = DefaultEngine::new(store.clone());
 
@@ -460,7 +492,8 @@ fn test_v2_checkpoint_supported_table() -> DeltaResult<()> {
             create_remove_action("fake_path_1"),
         ],
         0,
-    )?;
+    )
+    .await?;
 
     // 2nd commit: metadata & protocol actions
     // Protocol action includes the v2Checkpoint reader/writer feature.
@@ -471,7 +504,8 @@ fn test_v2_checkpoint_supported_table() -> DeltaResult<()> {
             create_v2_checkpoint_protocol_action(),
         ],
         1,
-    )?;
+    )
+    .await?;
 
     let table_root = Url::parse("memory:///")?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
@@ -514,13 +548,13 @@ fn test_v2_checkpoint_supported_table() -> DeltaResult<()> {
     // - size: 1 metadata + 1 protocol + 1 add action + 1 remove action + 1 checkpointMetadata
     // - numOfAddFiles: 1 add file from version 0
     // - sizeInBytes: passed to finalize (10)
-    assert_last_checkpoint_contents(&store, 1, 5, 1, size_in_bytes)?;
+    assert_last_checkpoint_contents(&store, 1, 5, 1, size_in_bytes).await?;
 
     Ok(())
 }
 
-#[test]
-fn test_no_checkpoint_staged_commits() -> DeltaResult<()> {
+#[tokio::test]
+async fn test_no_checkpoint_staged_commits() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
     let engine = DefaultEngine::new(store.clone());
 
@@ -529,22 +563,21 @@ fn test_no_checkpoint_staged_commits() -> DeltaResult<()> {
         &store,
         vec![create_metadata_action(), create_basic_protocol_action()],
         0,
-    )?;
+    )
+    .await?;
 
     // staged commit
     let staged_commit_path = Path::from(
         "_delta_log/_staged_commits/00000000000000000001.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json",
     );
-    futures::executor::block_on(async {
-        let add_action = Action::Add(Add::default());
-        store
-            .put(
-                &staged_commit_path,
-                serde_json::to_string(&add_action).unwrap().into(),
-            )
-            .await
-            .unwrap()
-    });
+    let add_action = Action::Add(Add::default());
+    store
+        .put(
+            &staged_commit_path,
+            serde_json::to_string(&add_action).unwrap().into(),
+        )
+        .await
+        .unwrap();
 
     let table_root = Url::parse("memory:///")?;
     let staged_commit = FileMeta {
@@ -562,3 +595,82 @@ fn test_no_checkpoint_staged_commits() -> DeltaResult<()> {
     ));
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_checkpoint_preserves_domain_metadata() -> DeltaResult<()> {
+    // ===== Setup =====
+    let tmp_dir = tempdir().unwrap();
+    let table_path = tmp_dir.path();
+    let table_url = Url::from_directory_path(table_path).unwrap();
+    std::fs::create_dir_all(table_path.join("_delta_log")).unwrap();
+
+    // ===== Create Table =====
+    let commit0 = [
+        json!({
+            "protocol": {
+                "minReaderVersion": 3,
+                "minWriterVersion": 7,
+                "readerFeatures": [],
+                "writerFeatures": ["domainMetadata"]
+            }
+        }),
+        json!({
+            "metaData": {
+                "id": "test-table-id",
+                "format": { "provider": "parquet", "options": {} },
+                "schemaString": "{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}",
+                "partitionColumns": [],
+                "configuration": {},
+                "createdTime": 1587968585495i64
+            }
+        }),
+    ]
+    .map(|j| j.to_string())
+    .join("\n");
+    std::fs::write(
+        table_path.join("_delta_log/00000000000000000000.json"),
+        commit0,
+    )
+    .unwrap();
+
+    // ===== Create Engine =====
+    let store = Arc::new(LocalFileSystem::new());
+    let executor = Arc::new(TokioMultiThreadExecutor::new(
+        tokio::runtime::Handle::current(),
+    ));
+    let engine = DefaultEngine::new_with_executor(store.clone(), executor);
+
+    let commit_domain_metadata = |domain: &str, value: &str| -> DeltaResult<()> {
+        let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+        let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()))?;
+        let result = txn
+            .with_domain_metadata(domain.to_string(), value.to_string())
+            .commit(&engine)?;
+        assert!(result.is_committed());
+        Ok(())
+    };
+
+    // ===== Commit Domain Metadata =====
+    commit_domain_metadata("foo", "bar1")?;
+    commit_domain_metadata("foo", "bar2")?;
+
+    // ===== Case 1: Verify domain metadata is preserved *before* checkpoint =====
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+    assert_eq!(snapshot.version(), 2);
+    let domain_value = snapshot.get_domain_metadata("foo", &engine)?;
+    assert_eq!(domain_value, Some("bar2".to_string()));
+
+    // Trigger checkpoint
+    do_checkpoint(snapshot, &engine)?;
+
+    // ===== Case 2: Verify domain metadata is preserved *after* checkpoint =====
+    let snapshot = Snapshot::builder_for(table_url)
+        .at_version(2)
+        .build(&engine)?;
+    let domain_value = snapshot.get_domain_metadata("foo", &engine)?;
+    assert_eq!(domain_value, Some("bar2".to_string()));
+
+    Ok(())
+}
+
+// TODO: Add test that checkpoint does not contain tombstoned domain metadata.

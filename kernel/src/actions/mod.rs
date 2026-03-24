@@ -2,8 +2,7 @@
 //! specification](https://github.com/delta-io/delta/blob/master/PROTOCOL.md)
 
 use std::collections::HashMap;
-use std::fmt::{Debug, Display};
-use std::hash::Hash;
+use std::fmt::Debug;
 use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
 
@@ -24,7 +23,6 @@ use url::Url;
 use visitors::{MetadataVisitor, ProtocolVisitor};
 
 use delta_kernel_derive::{internal_api, IntoEngineData, ToSchema};
-use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
 const KERNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -568,33 +566,6 @@ impl Protocol {
         self.has_table_feature(&TableFeature::CatalogManaged)
             || self.has_table_feature(&TableFeature::CatalogOwnedPreview)
     }
-
-    pub(crate) fn is_cdf_supported(&self) -> bool {
-        // TODO: we should probably expand this to ~all supported reader features instead of gating
-        // on a subset here. missing ones are:
-        // - variantType
-        // - typeWidening
-        // - catalogManaged
-        static CDF_SUPPORTED_READER_FEATURES: LazyLock<Vec<TableFeature>> = LazyLock::new(|| {
-            vec![
-                TableFeature::DeletionVectors,
-                TableFeature::ColumnMapping,
-                TableFeature::TimestampWithoutTimezone,
-                TableFeature::V2Checkpoint,
-                TableFeature::VacuumProtocolCheck,
-            ]
-        });
-        match self.reader_features() {
-            // if min_reader_version = 3 and all reader features are subset of supported => OK
-            Some(reader_features) if self.min_reader_version() == 3 => {
-                ensure_supported_features(reader_features, &CDF_SUPPORTED_READER_FEATURES).is_ok()
-            }
-            // if min_reader_version = 1 or 2 and there are no reader features => OK
-            None => (1..=2).contains(&self.min_reader_version()),
-            // any other protocol is not supported
-            _ => false,
-        }
-    }
 }
 
 // TODO: implement Scalar::From<HashMap<K, V>> so we can derive IntoEngineData using a macro (issue#1083)
@@ -634,43 +605,6 @@ impl IntoEngineData for Protocol {
 
         engine.evaluation_handler().create_one(schema, &values)
     }
-}
-
-// given `table_features`, check if they are subset of `supported_features`
-pub(crate) fn ensure_supported_features<T>(
-    table_features: &[T],
-    supported_features: &[T],
-) -> DeltaResult<()>
-where
-    T: Display + FromStr + Hash + Eq,
-    <T as FromStr>::Err: Display,
-{
-    // first check if all features are supported, else we proceed to craft an error message
-    if table_features
-        .iter()
-        .all(|feature| supported_features.contains(feature))
-    {
-        return Ok(());
-    }
-
-    // we get the type name (TableFeature) for better error messages
-    let features_type = std::any::type_name::<T>()
-        .rsplit("::")
-        .next()
-        .unwrap_or("table feature");
-
-    // NB: we didn't do this above to avoid allocation in the common case
-    let mut unsupported = table_features
-        .iter()
-        .filter(|feature| !supported_features.contains(*feature));
-
-    Err(Error::Unsupported(format!(
-        "Found unsupported {}s: \"{}\". Supported {}s: \"{}\"",
-        features_type,
-        unsupported.join("\", \""),
-        features_type,
-        supported_features.iter().join("\", \""),
-    )))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
@@ -1426,7 +1360,7 @@ mod tests {
     #[test]
     fn test_validate_table_features_unknown() {
         // Unknown features are allowed during validation for forward compatibility,
-        // but will be rejected when trying to use the protocol (ensure_read_supported/ensure_write_supported)
+        // but will be rejected when trying to use the protocol (ensure_operation_supported)
 
         // Test unknown features in reader - validation passes
         let protocol = Protocol {
@@ -1484,135 +1418,6 @@ mod tests {
 
             assert!(matches!(protocol.validate_table_features(), Ok(()),));
         }
-    }
-
-    use crate::table_configuration::TableConfiguration;
-    use crate::utils::test_utils::assert_result_error_with_message;
-
-    // TODO: Migrate these protocol validation tests to TableConfiguration.
-    // The ensure_read_supported and ensure_write_supported methods have been moved from Protocol
-    // to TableConfiguration. These tests should be refactored to use TableConfiguration instead.
-
-    // Helper to create a TableConfiguration for testing protocol validation
-    fn create_table_config_for_protocol(protocol: Protocol) -> DeltaResult<TableConfiguration> {
-        let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
-        let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new())?;
-        let table_root = url::Url::parse("file:///tmp/test").unwrap();
-        TableConfiguration::try_new(metadata, protocol, table_root, 0)
-    }
-
-    #[test]
-    fn test_v2_checkpoint_supported() {
-        let protocol = Protocol::try_new(
-            3,
-            7,
-            Some([TableFeature::V2Checkpoint]),
-            Some([TableFeature::V2Checkpoint]),
-        )
-        .unwrap();
-        assert!(create_table_config_for_protocol(protocol).is_ok());
-    }
-
-    #[test]
-    fn test_ensure_read_supported() {
-        let protocol = Protocol {
-            min_reader_version: 3,
-            min_writer_version: 7,
-            reader_features: Some(vec![]),
-            writer_features: Some(vec![]),
-        };
-        assert!(create_table_config_for_protocol(protocol).is_ok());
-
-        let protocol = Protocol::try_new(
-            3,
-            7,
-            Some([TableFeature::V2Checkpoint]),
-            Some([TableFeature::V2Checkpoint]),
-        )
-        .unwrap();
-        assert!(create_table_config_for_protocol(protocol).is_ok());
-
-        let protocol = Protocol {
-            min_reader_version: 1,
-            min_writer_version: 7,
-            reader_features: None,
-            writer_features: None,
-        };
-        assert!(create_table_config_for_protocol(protocol).is_ok());
-
-        let protocol = Protocol {
-            min_reader_version: 2,
-            min_writer_version: 7,
-            reader_features: None,
-            writer_features: None,
-        };
-        assert!(create_table_config_for_protocol(protocol).is_ok());
-    }
-
-    #[test]
-    fn test_ensure_write_supported() {
-        let protocol = Protocol::try_new(
-            3,
-            7,
-            Some(vec![TableFeature::DeletionVectors]),
-            Some(vec![
-                TableFeature::AppendOnly,
-                TableFeature::DeletionVectors,
-                TableFeature::DomainMetadata,
-                TableFeature::Invariants,
-                TableFeature::RowTracking,
-            ]),
-        )
-        .unwrap();
-        let config = create_table_config_for_protocol(protocol).unwrap();
-        assert!(config.ensure_write_supported().is_ok());
-
-        // Verify that unsupported reader features are rejected (TypeWidening is a ReaderWriter feature not supported for writes)
-        let protocol = Protocol::try_new(
-            3,
-            7,
-            Some([TableFeature::TypeWidening]),
-            Some([TableFeature::TypeWidening]),
-        )
-        .unwrap();
-        let config = create_table_config_for_protocol(protocol).unwrap();
-        assert_result_error_with_message(
-            config.ensure_write_supported(),
-            r#"Feature 'typeWidening' not supported for writes"#,
-        );
-
-        // Unknown writer features are allowed during Protocol creation for forward compatibility,
-        // but will fail when trying to create TableConfiguration (reads not supported)
-        let protocol = Protocol::try_new(
-            3,
-            7,
-            Some([TableFeature::Unknown("unsupported feature".to_string())]),
-            Some([TableFeature::Unknown("unsupported feature".to_string())]),
-        )
-        .unwrap();
-        assert_result_error_with_message(
-            create_table_config_for_protocol(protocol),
-            r#"Unsupported: Unknown feature 'unsupported feature'"#,
-        );
-    }
-
-    #[test]
-    fn test_illegal_writer_feature_combination() {
-        let protocol = Protocol::try_new(
-            3,
-            7,
-            Some::<Vec<String>>(vec![]),
-            Some(vec![
-                // No domain metadata even though that is required
-                TableFeature::RowTracking,
-            ]),
-        )
-        .unwrap();
-        let config = create_table_config_for_protocol(protocol).unwrap();
-        assert_result_error_with_message(
-            config.ensure_write_supported(),
-            "rowTracking requires domainMetadata to be supported",
-        );
     }
 
     #[test]
@@ -1683,21 +1488,6 @@ mod tests {
     }
 
     #[test]
-    fn test_ensure_supported_features() {
-        let supported_features = [TableFeature::ColumnMapping, TableFeature::DeletionVectors];
-        let table_features = vec![TableFeature::ColumnMapping];
-        ensure_supported_features(&table_features, &supported_features).unwrap();
-        // test unknown features
-        let table_features = vec![TableFeature::ColumnMapping, TableFeature::unknown("idk")];
-        let error = ensure_supported_features(&table_features, &supported_features).unwrap_err();
-        match error {
-            Error::Unsupported(e) if e ==
-                "Found unsupported TableFeatures: \"idk\". Supported TableFeatures: \"columnMapping\", \"deletionVectors\""
-            => {},
-            _ => panic!("Expected unsupported error, got: {error}"),
-        }
-    }
-    #[test]
     fn test_parse_table_feature_never_fails() {
         // parse a non-str
         let features = Some([5]);
@@ -1710,30 +1500,6 @@ mod tests {
             TableFeature::unknown("absurD_)(+13%^⚙️"),
         ]);
         assert_eq!(parse_features::<TableFeature>(features), expected);
-    }
-
-    #[cfg(feature = "catalog-managed")]
-    #[test]
-    fn test_catalog_managed_writes() {
-        let protocol = Protocol::try_new(
-            3,
-            7,
-            Some([TableFeature::CatalogManaged]),
-            Some([TableFeature::CatalogManaged]),
-        )
-        .unwrap();
-        let config = create_table_config_for_protocol(protocol).unwrap();
-        assert!(config.ensure_write_supported().is_ok());
-
-        let protocol = Protocol::try_new(
-            3,
-            7,
-            Some([TableFeature::CatalogOwnedPreview]),
-            Some([TableFeature::CatalogOwnedPreview]),
-        )
-        .unwrap();
-        let config = create_table_config_for_protocol(protocol).unwrap();
-        assert!(config.ensure_write_supported().is_ok());
     }
 
     #[test]
