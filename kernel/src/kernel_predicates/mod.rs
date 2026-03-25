@@ -843,23 +843,30 @@ pub trait DataSkippingPredicateEvaluator {
     ) -> Option<Self::Output> {
         let max = self.get_max_stat(col, &val.data_type())?;
 
-        // Delta Lake min/max stats are stored with millisecond precision (truncated, not rounded up) so we can't use direct comparison.
-        // For Ordering::Greater comparison we adjust timestamp values by subtracting 999 microseconds from the value to ensure
+        // Delta Lake min/max stats are stored with millisecond precision (truncated, not rounded up), so we can't use direct comparison.
+        // For max stats comparison, we adjust timestamp values by subtracting 999 microseconds from the value to ensure
         // that comparisons against max stats are correct. Any rows that pass this filter will be re-evaluated later for exact matches.
         // See:
-        // - https://github.com/delta-io/delta-kernel-rs/issues/1002
         // - https://github.com/delta-io/delta-kernel-rs/pull/1003
         if matches!(val, Scalar::Timestamp(_) | Scalar::TimestampNtz(_)) {
-            if !inverted && ord == Ordering::Greater {
-                let max_ts_adjusted = timestamp_subtract(val, 999);
-                tracing::debug!(
-                "Adjusted timestamp value for col {col} for max stat comparison from {val:?} to {max_ts_adjusted:?}"
-                );
-                return self.eval_partial_cmp(ord, max, &max_ts_adjusted, inverted);
+            match (ord, inverted) {
+                // col > val => stats.max.col > val
+                // NOT(col < val) => NOT(stats.max.col < val)
+                (Ordering::Greater, false) | (Ordering::Less, true) => {
+                    let max_ts_adjusted = timestamp_subtract(val, 999);
+                    tracing::debug!(
+                        "Adjusted timestamp value for col {col} for max stat comparison from {val:?} to {max_ts_adjusted:?}"
+                    );
+                    return self.eval_partial_cmp(ord, max, &max_ts_adjusted, inverted);
+                }
+                // // The following case is not currently used but included for completeness and to ensure correctness in the future if logic is changed to use it.
+                // !(max > val) or max < val
+                (Ordering::Greater, true) | (Ordering::Less, false) => {
+                    return self.eval_partial_cmp(ord, max, val, inverted);
+                }
+                // Equality comparison can't be applied as max stats is truncated to milliseconds, so actual microsecond value is unknown.
+                (Ordering::Equal, _) => return None,
             }
-
-            // Disabled by default: https://github.com/delta-io/delta-kernel-rs/issues/1002
-            return None;
         }
 
         self.eval_partial_cmp(ord, max, val, inverted)
