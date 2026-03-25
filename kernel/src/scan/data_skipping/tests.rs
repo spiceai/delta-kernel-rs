@@ -365,7 +365,7 @@ fn test_timestamp_predicates_data_skip() {
         let skipping_pred = as_data_skipping_predicate(&pred);
         assert_eq!(
             skipping_pred.unwrap().to_string(),
-            "AND(NOT(Column(minValues.ts_col) > 1000000), null)"
+            "AND(NOT(Column(minValues.ts_col) > 1000000), NOT(Column(maxValues.ts_col) < 999001))"
         );
 
         let pred = Pred::ne(col.clone(), timestamp.clone());
