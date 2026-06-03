@@ -31,16 +31,16 @@ version = "0.18.2"
 
 [patch.crates-io]
 # Use spiceai arrow-rs fork with new_with_meta API
-arrow = { git = "https://github.com/spiceai/arrow-rs.git", branch = "spiceai-57" }
-arrow-array = { git = "https://github.com/spiceai/arrow-rs.git", branch = "spiceai-57" }
-arrow-buffer = { git = "https://github.com/spiceai/arrow-rs.git", branch = "spiceai-57" }
-arrow-cast = { git = "https://github.com/spiceai/arrow-rs.git", branch = "spiceai-57" }
-arrow-data = { git = "https://github.com/spiceai/arrow-rs.git", branch = "spiceai-57" }
-arrow-ipc = { git = "https://github.com/spiceai/arrow-rs.git", branch = "spiceai-57" }
-arrow-json = { git = "https://github.com/spiceai/arrow-rs.git", branch = "spiceai-57" }
-arrow-ord = { git = "https://github.com/spiceai/arrow-rs.git", branch = "spiceai-57" }
-arrow-row = { git = "https://github.com/spiceai/arrow-rs.git", branch = "spiceai-57" }
-arrow-schema = { git = "https://github.com/spiceai/arrow-rs.git", branch = "spiceai-57" }
-arrow-select = { git = "https://github.com/spiceai/arrow-rs.git", branch = "spiceai-57" }
-arrow-string = { git = "https://github.com/spiceai/arrow-rs.git", branch = "spiceai-57" }
-parquet = { git = "https://github.com/spiceai/arrow-rs.git", branch = "spiceai-57" }
+arrow = { git = "https://github.com/spiceai/arrow-rs.git", rev = "70b568f01bbe2546f2e97bbdbae1fdf08b57d74a" }
+arrow-array = { git = "https://github.com/spiceai/arrow-rs.git", rev = "70b568f01bbe2546f2e97bbdbae1fdf08b57d74a" }
+arrow-buffer = { git = "https://github.com/spiceai/arrow-rs.git", rev = "70b568f01bbe2546f2e97bbdbae1fdf08b57d74a" }
+arrow-cast = { git = "https://github.com/spiceai/arrow-rs.git", rev = "70b568f01bbe2546f2e97bbdbae1fdf08b57d74a" }
+arrow-data = { git = "https://github.com/spiceai/arrow-rs.git", rev = "70b568f01bbe2546f2e97bbdbae1fdf08b57d74a" }
+arrow-ipc = { git = "https://github.com/spiceai/arrow-rs.git", rev = "70b568f01bbe2546f2e97bbdbae1fdf08b57d74a" }
+arrow-json = { git = "https://github.com/spiceai/arrow-rs.git", rev = "70b568f01bbe2546f2e97bbdbae1fdf08b57d74a" }
+arrow-ord = { git = "https://github.com/spiceai/arrow-rs.git", rev = "70b568f01bbe2546f2e97bbdbae1fdf08b57d74a" }
+arrow-row = { git = "https://github.com/spiceai/arrow-rs.git", rev = "70b568f01bbe2546f2e97bbdbae1fdf08b57d74a" }
+arrow-schema = { git = "https://github.com/spiceai/arrow-rs.git", rev = "70b568f01bbe2546f2e97bbdbae1fdf08b57d74a" }
+arrow-select = { git = "https://github.com/spiceai/arrow-rs.git", rev = "70b568f01bbe2546f2e97bbdbae1fdf08b57d74a" }
+arrow-string = { git = "https://github.com/spiceai/arrow-rs.git", rev = "70b568f01bbe2546f2e97bbdbae1fdf08b57d74a" }
+parquet = { git = "https://github.com/spiceai/arrow-rs.git", rev = "70b568f01bbe2546f2e97bbdbae1fdf08b57d74a" }
