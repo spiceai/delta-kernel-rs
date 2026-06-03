@@ -1,6 +1,12 @@
 //! This module re-exports the different versions of arrow, parquet, and object_store we support.
 
-#[cfg(feature = "arrow-57")]
+#[cfg(feature = "arrow-58")]
+mod arrow_compat_shims {
+    pub use arrow_58 as arrow;
+    pub use parquet_58 as parquet;
+}
+
+#[cfg(all(feature = "arrow-57", not(feature = "arrow-58")))]
 mod arrow_compat_shims {
     pub use arrow_57 as arrow;
     pub use parquet_57 as parquet;
@@ -8,6 +14,7 @@ mod arrow_compat_shims {
 
 #[cfg(all(
     feature = "arrow-56",
+    not(feature = "arrow-58"),
     not(feature = "arrow-57"),
     not(feature = "arrow-55")
 ))]
@@ -18,6 +25,7 @@ mod arrow_compat_shims {
 
 #[cfg(all(
     feature = "arrow-55",
+    not(feature = "arrow-58"),
     not(feature = "arrow-57"),
     not(feature = "arrow-56")
 ))]
@@ -32,9 +40,15 @@ mod arrow_compat_shims {
     feature = "need-arrow",
     not(feature = "arrow-55"),
     not(feature = "arrow-56"),
-    not(feature = "arrow-57")
+    not(feature = "arrow-57"),
+    not(feature = "arrow-58")
 ))]
-compile_error!("Requested a feature that needs arrow without enabling arrow. Please enable the `arrow-55`, `arrow-56`, or `arrow-57` feature");
+compile_error!("Requested a feature that needs arrow without enabling arrow. Please enable the `arrow-55`, `arrow-56`, `arrow-57`, or `arrow-58` feature");
 
-#[cfg(any(feature = "arrow-55", feature = "arrow-56", feature = "arrow-57"))]
+#[cfg(any(
+    feature = "arrow-55",
+    feature = "arrow-56",
+    feature = "arrow-57",
+    feature = "arrow-58"
+))]
 pub use arrow_compat_shims::*;

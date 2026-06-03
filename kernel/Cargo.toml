@@ -103,6 +103,18 @@ version = "57"
 features = ["async", "object_store"]
 optional = true
 
+# arrow 58
+[dependencies.arrow_58]
+package = "arrow"
+version = "58"
+features = ["chrono-tz", "ffi", "json", "prettyprint"]
+optional = true
+[dependencies.parquet_58]
+package = "parquet"
+version = "58"
+features = ["async", "object_store"]
+optional = true
+
 [features]
 # no default features
 default = []
@@ -112,12 +124,13 @@ internal-api = []
 integration-test = ["hdfs-native-object-store/integration-test"]
 
 # The default versions for arrow/parquet/object_store
-arrow = ["arrow-57"] # latest arrow version
+arrow = ["arrow-58"] # latest arrow version
 need-arrow = [] # need-arrow is a marker that the feature needs arrow dep
 
 arrow-55 = ["dep:arrow_55", "dep:parquet_55", "object_store", "comfy-table"]
 arrow-56 = ["dep:arrow_56", "dep:parquet_56", "object_store", "comfy-table"]
 arrow-57 = ["dep:arrow_57", "dep:parquet_57", "object_store", "comfy-table"]
+arrow-58 = ["dep:arrow_58", "dep:parquet_58", "object_store", "comfy-table"]
 arrow-conversion = ["need-arrow"]
 arrow-expression = ["need-arrow"]
 
