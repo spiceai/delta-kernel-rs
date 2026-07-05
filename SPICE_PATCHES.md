@@ -26,9 +26,9 @@ what `spice2` resolves to.
 
 Unlike the byte-clean 0.23.0 bump, upstream v0.24.0 carries several breaking API
 changes. None affect the (zero) fork patches above, but `spice2` code that
-consumes kernel may need to adapt. See the
+consumes the kernel may need to adapt. See the
 [v0.24.0 release notes](https://github.com/delta-io/delta-kernel-rs/releases/tag/v0.24.0)
-for the full list; the notable ones:
+for the full list; notable ones include:
 
 - `metrics` module reorganized: `MetricEvent` variants now wrap a per-event
   struct (e.g. `MetricEvent::ScanMetadataCompleted(ScanMetadataCompleted { .. })`);
