@@ -4931,7 +4931,15 @@ fn test_combine_checkpoint_predicates(
     r#"{"commitInfo":{"timestamp":1000,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","description":null}}}"#
 )]
 // metaData.configuration.key2: null
-#[should_panic(expected = "StructArray re-validation failed")]
+//
+// The exact panic site and message text are Arrow-version-dependent: on arrow 59.0.0 the
+// null value survives into the RecordBatch and is only caught by this test's own
+// `StructArray::try_new` re-validation below ("StructArray re-validation failed"); on
+// arrow 59.3.0 Arrow's own batch iteration now rejects it earlier, during
+// `read_actions`, with "Found unmasked nulls for non-nullable StructArray field". Match
+// on the substring both messages share so the test tracks the same known issue across
+// arrow patch versions rather than the exact wording or call site.
+#[should_panic(expected = "StructArray")]
 #[case::metadata_configuration_known_issue(
     "metaData",
     "configuration",
