@@ -5,6 +5,7 @@ use std::num::NonZero;
 use std::ops::Range;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use delta_kernel::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
 use delta_kernel::arrow::array::{Array, Int64Array, RecordBatch, StringArray, StructArray};
 use delta_kernel::arrow::datatypes::{DataType, Field, Schema};
@@ -16,16 +17,19 @@ use delta_kernel::engine::arrow_utils::{
 use delta_kernel::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use delta_kernel::engine::{reader_options, writer_options};
 use delta_kernel::expressions::ColumnName;
+use delta_kernel::object_store::buffered::BufWriter;
 use delta_kernel::object_store::path::Path;
-use delta_kernel::object_store::{DynObjectStore, ObjectStoreExt as _};
+use delta_kernel::object_store::{DynObjectStore, GetOptions, GetRange, ObjectStoreExt as _};
 use delta_kernel::parquet::arrow::arrow_reader::{
-    ArrowReaderMetadata, ParquetRecordBatchReaderBuilder,
+    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
 };
 use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
 use delta_kernel::parquet::arrow::async_reader::{
-    ParquetObjectReader, ParquetRecordBatchStreamBuilder,
+    AsyncFileReader, MetadataSuffixFetch, ParquetRecordBatchStreamBuilder,
 };
-use delta_kernel::parquet::arrow::async_writer::{AsyncArrowWriter, ParquetObjectWriter};
+use delta_kernel::parquet::arrow::async_writer::AsyncArrowWriter;
+use delta_kernel::parquet::errors::{ParquetError, Result as ParquetResult};
+use delta_kernel::parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
 use delta_kernel::schema::{SchemaRef, StructType};
 use delta_kernel::transaction::BoundWriteContext;
 use delta_kernel::{
@@ -33,8 +37,9 @@ use delta_kernel::{
     FileDataReadResultIterator, FileMeta, FoldWithOption as _, ParquetFooter, ParquetHandler,
     PredicateRef,
 };
+use futures::future::BoxFuture;
 use futures::stream::{self, BoxStream};
-use futures::{StreamExt, TryStreamExt};
+use futures::{FutureExt as _, StreamExt, TryFutureExt as _, TryStreamExt};
 use uuid::Uuid;
 
 use crate::executor::TaskExecutor;
@@ -383,7 +388,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
             let first_arrow = ArrowEngineData::try_from_engine_data(first_batch)?;
             let first_record_batch: RecordBatch = (*first_arrow).into();
 
-            let object_writer = ParquetObjectWriter::new(store, path);
+            let object_writer = BufWriter::new(store, path);
             let schema = first_record_batch.schema();
             let mut writer =
                 AsyncArrowWriter::try_new_with_options(object_writer, schema, writer_options())?;
@@ -432,7 +437,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
                 ArrowReaderMetadata::load(&bytes, reader_options())?
             } else {
                 let path = Path::from_url_path(location.path())?;
-                let mut reader = ParquetObjectReader::new(store, path).with_file_size(file_size);
+                let mut reader = ObjectStoreFileReader::new(store, path).with_file_size(file_size);
                 ArrowReaderMetadata::load_async(&mut reader, reader_options()).await?
             };
 
@@ -446,6 +451,93 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
                 .unwrap_or(Err(Error::Cancelled)),
             None => self.task_executor.block_on(footer_future),
         }
+    }
+}
+
+/// An [`AsyncFileReader`] for a Parquet file at `path` in an object store.
+///
+/// With a known file size the footer is read with bounded range requests; without one it falls
+/// back to a suffix range request, which not every store supports (e.g. Azure).
+#[derive(Clone, Debug)]
+struct ObjectStoreFileReader {
+    store: Arc<DynObjectStore>,
+    path: Path,
+    file_size: Option<u64>,
+}
+
+impl ObjectStoreFileReader {
+    fn new(store: Arc<DynObjectStore>, path: Path) -> Self {
+        Self {
+            store,
+            path,
+            file_size: None,
+        }
+    }
+
+    fn with_file_size(self, file_size: u64) -> Self {
+        Self {
+            file_size: Some(file_size),
+            ..self
+        }
+    }
+}
+
+fn to_parquet_err(e: delta_kernel::object_store::Error) -> ParquetError {
+    ParquetError::External(Box::new(e))
+}
+
+impl AsyncFileReader for ObjectStoreFileReader {
+    fn get_bytes(&mut self, range: Range<u64>) -> BoxFuture<'_, ParquetResult<Bytes>> {
+        self.store
+            .get_range(&self.path, range)
+            .map_err(to_parquet_err)
+            .boxed()
+    }
+
+    fn get_byte_ranges(
+        &mut self,
+        ranges: Vec<Range<u64>>,
+    ) -> BoxFuture<'_, ParquetResult<Vec<Bytes>>> {
+        async move {
+            self.store
+                .get_ranges(&self.path, &ranges)
+                .await
+                .map_err(to_parquet_err)
+        }
+        .boxed()
+    }
+
+    fn get_metadata<'a>(
+        &'a mut self,
+        options: Option<&'a ArrowReaderOptions>,
+    ) -> BoxFuture<'a, ParquetResult<Arc<ParquetMetaData>>> {
+        async move {
+            let reader = ParquetMetaDataReader::new().with_arrow_reader_options(options);
+            let metadata = match self.file_size {
+                Some(file_size) => reader.load_and_finish(self, file_size).await?,
+                None => reader.load_via_suffix_and_finish(self).await?,
+            };
+            Ok(Arc::new(metadata))
+        }
+        .boxed()
+    }
+}
+
+impl MetadataSuffixFetch for &mut ObjectStoreFileReader {
+    fn fetch_suffix(&mut self, suffix: usize) -> BoxFuture<'_, ParquetResult<Bytes>> {
+        let options = GetOptions {
+            range: Some(GetRange::Suffix(suffix as u64)),
+            ..Default::default()
+        };
+        async move {
+            let resp = self
+                .store
+                .get_opts(&self.path, options)
+                .await
+                .map_err(to_parquet_err)?;
+            resp.bytes().await.map_err(to_parquet_err)
+        }
+        .boxed()
     }
 }
 
@@ -463,7 +555,7 @@ async fn open_parquet_file(
 
     let mut reader = {
         use delta_kernel::object_store::ObjectStoreScheme;
-        // HACK: unfortunately, `ParquetObjectReader` under the hood does a suffix range
+        // HACK: unfortunately, `ObjectStoreFileReader` without a file size does a suffix range
         // request which isn't supported by Azure. For now we just detect if the URL is
         // pointing to azure and if so, do a HEAD request so we can pass in file size to the
         // reader which will cause the reader to avoid a suffix range request.
@@ -474,16 +566,16 @@ async fn open_parquet_file(
         // the extracted size will be zero in this case. Thus, this function
         // need to handle the case of zero file_meta.size.
         if file_meta.size != 0 {
-            ParquetObjectReader::new(store, path).with_file_size(file_meta.size)
+            ObjectStoreFileReader::new(store, path).with_file_size(file_meta.size)
         } else if let Ok((ObjectStoreScheme::MicrosoftAzure, _)) =
             ObjectStoreScheme::parse(&file_meta.location)
         {
             // also note doing HEAD then actual GET isn't atomic, and leaves us vulnerable
             // to file changing between the two calls.
             let meta = store.head(&path).await?;
-            ParquetObjectReader::new(store, path).with_file_size(meta.size)
+            ObjectStoreFileReader::new(store, path).with_file_size(meta.size)
         } else {
-            ParquetObjectReader::new(store, path)
+            ObjectStoreFileReader::new(store, path)
         }
     };
 
@@ -721,7 +813,7 @@ mod tests {
     async fn read_all_rows_helper(file_meta: FileMeta) -> DeltaResult<Vec<RecordBatch>> {
         let store = Arc::new(LocalFileSystem::new());
         let path = Path::from_url_path(file_meta.location.path()).unwrap();
-        let reader = ParquetObjectReader::new(store.clone(), path);
+        let reader = ObjectStoreFileReader::new(store.clone(), path);
         let physical_schema = ParquetRecordBatchStreamBuilder::new(reader)
             .await
             .unwrap()
@@ -790,7 +882,7 @@ mod tests {
         // depending on parquet version). The reader builder must not exceed this.
         let baseline_store = Arc::new(GetOptsCountingStore::new(LocalFileSystem::new()));
         let mut reader =
-            ParquetObjectReader::new(baseline_store.clone(), location).with_file_size(file_size);
+            ObjectStoreFileReader::new(baseline_store.clone(), location).with_file_size(file_size);
         let metadata = ArrowReaderMetadata::load_async(&mut reader, reader_options())
             .await
             .unwrap();
@@ -839,7 +931,7 @@ mod tests {
         let location = Path::from_url_path(url.path()).unwrap();
         let meta = store.head(&location).await.unwrap();
 
-        let reader = ParquetObjectReader::new(store.clone(), location);
+        let reader = ObjectStoreFileReader::new(store.clone(), location);
         let physical_schema = ParquetRecordBatchStreamBuilder::new(reader)
             .await
             .unwrap()
@@ -1110,7 +1202,7 @@ mod tests {
 
         // check we can read back
         let path = Path::from_url_path(location.path()).unwrap();
-        let reader = ParquetObjectReader::new(store.clone(), path);
+        let reader = ObjectStoreFileReader::new(store.clone(), path);
         let physical_schema = ParquetRecordBatchStreamBuilder::new(reader)
             .await
             .unwrap()
@@ -1195,7 +1287,7 @@ mod tests {
         // Verify we can read the file back
         let path = Path::from_url_path(file_url.path()).unwrap();
         let metadata = store.head(&path).await.unwrap();
-        let reader = ParquetObjectReader::new(store.clone(), path);
+        let reader = ObjectStoreFileReader::new(store.clone(), path);
         let physical_schema = ParquetRecordBatchStreamBuilder::new(reader)
             .await
             .unwrap()
@@ -1246,7 +1338,7 @@ mod tests {
 
         let path = Path::from_url_path(file_url.path()).unwrap();
         let metadata = store.head(&path).await.unwrap();
-        let reader = ParquetObjectReader::new(store.clone(), path);
+        let reader = ObjectStoreFileReader::new(store.clone(), path);
         let physical_schema = ParquetRecordBatchStreamBuilder::new(reader)
             .await
             .unwrap()
@@ -1397,7 +1489,7 @@ mod tests {
         // Read it back
         let path = Path::from_url_path(file_url.path()).unwrap();
         let metadata = store.head(&path).await.unwrap();
-        let reader = ParquetObjectReader::new(store.clone(), path);
+        let reader = ObjectStoreFileReader::new(store.clone(), path);
         let physical_schema = ParquetRecordBatchStreamBuilder::new(reader)
             .await
             .unwrap()
@@ -1742,7 +1834,7 @@ mod tests {
             .unwrap();
 
         let path = Path::from_url_path(metadata.file_meta.location.path()).unwrap();
-        let reader = ParquetObjectReader::new(store, path);
+        let reader = ObjectStoreFileReader::new(store, path);
         let builder = ParquetRecordBatchStreamBuilder::new(reader).await.unwrap();
         let kv = builder.metadata().file_metadata().key_value_metadata();
         let has = kv
@@ -1787,7 +1879,7 @@ mod tests {
         assert!(nested_path.exists());
 
         let path = Path::from_url_path(file_url.path()).unwrap();
-        let reader = ParquetObjectReader::new(store.clone(), path);
+        let reader = ObjectStoreFileReader::new(store.clone(), path);
         let batches: Vec<RecordBatch> = ParquetRecordBatchStreamBuilder::new(reader)
             .await
             .unwrap()

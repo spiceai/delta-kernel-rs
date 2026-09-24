@@ -14,12 +14,10 @@ use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::object_store::ObjectStore;
-use delta_kernel::parquet::arrow::async_reader::{
-    ParquetObjectReader, ParquetRecordBatchStreamBuilder,
-};
+use delta_kernel::object_store::ObjectStoreExt as _;
+use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use delta_kernel::{DeltaResult, Snapshot};
 use futures::stream::TryStreamExt;
-use futures::StreamExt;
 use itertools::Itertools;
 use paste::paste;
 use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
@@ -36,13 +34,12 @@ async fn read_expected(path: &Path) -> DeltaResult<RecordBatch> {
     for meta in files.into_iter() {
         if let Some(ext) = meta.location.extension() {
             if ext == "parquet" {
-                let reader = ParquetObjectReader::new(store.clone(), meta.location);
-                let builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
+                let bytes = store.get(&meta.location).await?.bytes().await?;
+                let builder = ParquetRecordBatchReaderBuilder::try_new(bytes)?;
                 if schema.is_none() {
                     schema = Some(builder.schema().clone());
                 }
-                let mut stream = builder.build()?;
-                while let Some(batch) = stream.next().await {
+                for batch in builder.build()? {
                     batches.push(batch?);
                 }
             }

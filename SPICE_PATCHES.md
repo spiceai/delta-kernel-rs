@@ -16,7 +16,9 @@ hand-rolled Arrow bump on top of an older tag.
 
 ## Patch status
 
-**No Spice-specific code patches are required on top of upstream v0.28.0.**
+**No Spice-specific code patches are required on top of upstream v0.28.0**
+beyond the Arrow 59.2.0 follow-ups below (a dependency floor, a test match,
+and replacing APIs that Arrow 59.2.0 deprecates).
 
 The two Spice patches that existed on the earlier 0.18.x fork line remain
 upstreamed and present, unmodified, through `v0.23.0`, `v0.24.0`, and now
@@ -71,6 +73,38 @@ panics, without pinning the exact Arrow-version-dependent wording or call
 site. Verified: `cargo test -p delta_kernel --lib --features arrow-59`
 reports `4030 passed; 0 failed` after the fix (previously `4029 passed; 1
 failed` before it, `4030 passed; 0 failed` on pristine `v0.28.0`).
+
+## Arrow 59.2.0 deprecations
+
+Built against Spice's `arrow-rs` fork (`spiceai-59-patches`), the workspace
+emitted deprecation warnings for APIs that Arrow 59.x retires. They are
+replaced rather than silenced:
+
+- `MutableArrayData::extend` / `extend_nulls` → `try_extend` /
+  `try_extend_nulls` in `kernel/src/engine/arrow_expression/evaluate_expression.rs`
+  (array construction and `coalesce`). An offset overflow now returns an error
+  instead of panicking.
+- `ParquetObjectReader` (whole type deprecated upstream in 59.2.0, see
+  apache/arrow-rs#10308; the fork additionally deprecates `new` in favour of
+  `new_with_meta`) → a private `ObjectStoreFileReader` implementing
+  `AsyncFileReader` in `default-engine/src/parquet.rs`. It keeps the previous
+  behaviour: bounded range reads for the footer when the file size is known,
+  a suffix range request otherwise (so the Azure HEAD + file-size workaround
+  still applies), and it honours `ArrowReaderOptions` via
+  `ParquetMetaDataReader::with_arrow_reader_options`. Delta Kernel used none of
+  the fork's reader extensions (object versioning, preload, size hints,
+  runtime).
+- `ParquetObjectWriter` → `object_store::buffered::BufWriter` passed directly
+  to `AsyncArrowWriter` (blanket `AsyncFileWriter` impl for `AsyncWrite`).
+- `acceptance/src/data.rs` and `kernel/tests/integration/golden_tables.rs`
+  read their small local expected-result files into memory and use the sync
+  `ParquetRecordBatchReaderBuilder`.
+
+Verified: `cargo clippy -p delta_kernel -p delta_kernel_default_engine -p
+acceptance --all-targets --all-features` reports no warnings;
+`cargo test --all-features -p delta_kernel_default_engine -p acceptance`
+passes (including the footer test that bounds `get_opts` calls per footer
+load), as do the kernel `golden` integration and `arrow_expression` lib tests.
 
 ## Consuming this in spiceai/spiceai
 
