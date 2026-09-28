@@ -3,8 +3,8 @@
 `spiceai-0.27` is Spice's fork line for upstream Delta Kernel 0.27.x. It is pristine upstream
 [`v0.27.1`](https://github.com/delta-io/delta-kernel-rs/tree/v0.27.1) (commit
 `728aeb966be250d0520df7aad873818e809e77f2`, tagged `upstream-v0.27.1` in this repo) merged into
-the previous fork line (`spiceai-0.23.0`). Apart from this file, the tree is byte-identical to
-upstream v0.27.1.
+the previous fork line (`spiceai-0.23.0`). Apart from this file and two backported upstream CI
+fixes (below), the tree is identical to upstream v0.27.1.
 
 ## Patch status
 
@@ -21,6 +21,17 @@ v0.27.1:
 The historical patches also depended on the `spiceai/arrow-rs` fork's `new_with_meta()` API.
 That dependency is no longer needed: v0.27.1 builds against standard upstream `arrow`. Arrow 58
 is still supported but is no longer the default (see below).
+
+## Backported upstream CI fixes
+
+The fork's CI runs the latest stable and nightly toolchains, and Rust 1.98 plus current nightly
+rustfmt postdate v0.27.1. Two upstream commits from after v0.27.1 are cherry-picked so CI passes.
+Neither changes behavior, and both ship in upstream v0.28.0, so the next upstream merge absorbs
+them:
+
+- `d265e8f9` chore: fix new warnings from clippy upgrade (#3164). `chunks_exact(2)` ->
+  `as_chunks::<2>()` in `kernel/src/expressions/sql.rs`, and three unused test imports in `ffi`.
+- `7316cb6e` chore: apply current nightly rustfmt (#3218). Comment re-wrapping only.
 
 ## Upstream API changes since v0.23.0 (consumer notes)
 
@@ -73,6 +84,6 @@ delta_kernel = { git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "
 delta_kernel_default_engine = { git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "728aeb966be250d0520df7aad873818e809e77f2" } # branch: spiceai-0.27
 ```
 
-Because there are no Spice patches, pinning the pristine upstream commit is correct. If a
-future Spice patch becomes necessary, add it as a commit on `spiceai-0.27` and bump the `spice2`
-pin to the patched commit.
+The backported CI fixes don't change behavior, so pinning the pristine upstream commit is
+correct. If a future Spice patch becomes necessary, add it as a commit on `spiceai-0.27` and bump
+the `spice2` pin to the patched commit.
