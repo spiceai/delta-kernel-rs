@@ -35,7 +35,7 @@ use crate::schema::{
     column_name, schema_ref, ColumnName, ColumnNamesAndTypes, DataType, MetadataColumnSpec,
     StructField, StructType,
 };
-use crate::{DeltaResult, Engine, EngineData, Error, Version};
+use crate::{DeltaResult, Engine, EngineData, KernelError, Version};
 
 impl LogSegment {
     /// Read the latest Protocol and Metadata from this log segment, using CRC when available.
@@ -51,9 +51,9 @@ impl LogSegment {
     ) -> DeltaResult<(Metadata, Protocol, ProtocolMetadataSource)> {
         match self.read_protocol_metadata_opt(engine, crc)? {
             (Some(m), Some(p), source) => Ok((m, p, source)),
-            (None, Some(_), _) => Err(Error::MissingMetadata),
-            (Some(_), None, _) => Err(Error::MissingProtocol),
-            (None, None, _) => Err(Error::MissingMetadataAndProtocol),
+            (None, Some(_), _) => Err(KernelError::MissingMetadata),
+            (Some(_), None, _) => Err(KernelError::MissingProtocol),
+            (None, None, _) => Err(KernelError::MissingMetadataAndProtocol),
         }
     }
 
@@ -279,8 +279,9 @@ impl LogSegment {
             let version = if batch.is_log_batch {
                 batch_version(batch.actions.as_ref())? as i64
             } else {
-                checkpoint_version
-                    .ok_or_else(|| Error::internal_error("checkpoint batch without a version"))?
+                checkpoint_version.ok_or_else(|| {
+                    KernelError::internal_error("checkpoint batch without a version")
+                })?
             };
             Ok(VersionedBatch {
                 protocol_version: Some(version),
@@ -356,12 +357,12 @@ fn batch_version(data: &dyn EngineData) -> DeltaResult<Version> {
     visitor.visit_rows_of(data)?;
     let file = visitor
         .file
-        .ok_or_else(|| Error::internal_error("commit batch missing _file column"))?;
+        .ok_or_else(|| KernelError::internal_error("commit batch missing _file column"))?;
     let url = Url::parse(&file)
-        .map_err(|e| Error::internal_error(format!("batch has invalid _file {file}: {e}")))?;
+        .map_err(|e| KernelError::internal_error(format!("batch has invalid _file {file}: {e}")))?;
     ParsedLogPath::try_from(url)?
         .map(|path| path.version)
-        .ok_or_else(|| Error::internal_error(format!("batch from non-log file {file}")))
+        .ok_or_else(|| KernelError::internal_error(format!("batch from non-log file {file}")))
 }
 
 /// Whether `winner` is set at a version at least `batch_version`.
@@ -512,7 +513,7 @@ mod tests {
     use crate::plans::{Operation, PlanExecutor, PlanResult};
     use crate::Snapshot;
     #[cfg(feature = "declarative-plans")]
-    use crate::{DeltaResult, Error};
+    use crate::{DeltaResult, KernelError};
 
     #[cfg(feature = "declarative-plans")]
     struct FailingPlanExecutor;
@@ -520,7 +521,7 @@ mod tests {
     #[cfg(feature = "declarative-plans")]
     impl PlanExecutor for FailingPlanExecutor {
         fn execute_op(&self, _op: Operation) -> DeltaResult<PlanResult> {
-            Err(Error::generic("plan executor deliberately failed"))
+            Err(KernelError::generic("plan executor deliberately failed"))
         }
     }
 
