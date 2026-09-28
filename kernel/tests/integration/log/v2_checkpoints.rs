@@ -2,31 +2,32 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
+use delta_kernel::actions::{MAX_VALUES, MIN_VALUES, NUM_RECORDS};
 use delta_kernel::arrow::array::{
     Array, ArrayRef, AsArray, Int32Array, Int64Array, RecordBatch, RecordBatchReader, StringArray,
     StructArray,
 };
-use delta_kernel::arrow::compute::concat_batches;
 use delta_kernel::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
 };
 use delta_kernel::checkpoint::{CheckpointSpec, V2CheckpointConfig};
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryFromKernel;
-use delta_kernel::engine::default::executor::TaskExecutor;
 use delta_kernel::expressions::Scalar;
 use delta_kernel::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use delta_kernel::schema::{DataType, StructField, StructType};
+use delta_kernel::schema::{schema_ref, DataType, StructField, StructType};
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::transaction::CommitResult;
 use delta_kernel::{DeltaResult, Engine, Snapshot};
 use itertools::Itertools;
+use test_utils::delta_kernel_default_engine::executor::TaskExecutor;
 use test_utils::{
     begin_transaction, create_add_files_metadata, create_table_and_load_snapshot, insert_data,
     load_test_data, read_add_infos, read_scan, test_table_setup_mt, write_batch_to_table,
 };
 
+use crate::common::read_utils::read_parquet_file;
 use crate::common::write_utils::{
     get_simple_schema, load_existing_single_file_checkpoint_path, resolve_struct_field,
     simple_id_batch,
@@ -261,10 +262,7 @@ async fn test_v2_checkpoint_parquet_write() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
 
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "value",
-        DataType::INTEGER,
-    )])?);
+    let schema = schema_ref! { nullable "value": INTEGER };
     let _ = create_table(&table_path, schema.clone(), "Test/1.0")
         .with_table_properties([("delta.feature.v2Checkpoint", "supported")])
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
@@ -622,7 +620,7 @@ async fn test_v2_checkpoint_partition_values_parsed_and_stats(
         let stats_parsed = get_struct_column_from_struct_array(add_col, "stats_parsed");
 
         let num_records_col = stats_parsed
-            .column_by_name("numRecords")
+            .column_by_name(NUM_RECORDS)
             .expect("stats_parsed should have numRecords");
         for &row in &add_rows {
             all_record_counts.push(
@@ -632,7 +630,7 @@ async fn test_v2_checkpoint_partition_values_parsed_and_stats(
             );
         }
 
-        let min_values = get_struct_column_from_struct_array(stats_parsed, "minValues");
+        let min_values = get_struct_column_from_struct_array(stats_parsed, MIN_VALUES);
         let min_id_col = min_values
             .column_by_name("id")
             .expect("minValues should have id");
@@ -644,7 +642,7 @@ async fn test_v2_checkpoint_partition_values_parsed_and_stats(
             );
         }
 
-        let max_values = get_struct_column_from_struct_array(stats_parsed, "maxValues");
+        let max_values = get_struct_column_from_struct_array(stats_parsed, MAX_VALUES);
         let max_id_col = max_values
             .column_by_name("id")
             .expect("maxValues should have id");
@@ -698,7 +696,7 @@ async fn test_v2_checkpoint_partition_values_parsed_and_stats(
         .iter()
         .map(|s| serde_json::from_str(s).expect("add.stats should be valid JSON"))
         .collect();
-    parsed_stats.sort_by_key(|v| v["numRecords"].as_i64().unwrap());
+    parsed_stats.sort_by_key(|v| v[NUM_RECORDS].as_i64().unwrap());
     assert_eq!(
         parsed_stats,
         vec![
@@ -766,10 +764,7 @@ async fn test_checkpoint_spec_rejected(
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
 
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "value",
-        DataType::INTEGER,
-    )])?);
+    let schema = schema_ref! { nullable "value": INTEGER };
 
     let mut builder = create_table(&table_path, schema, "Test/1.0");
     if enable_v2checkpoint {
@@ -799,10 +794,7 @@ async fn test_v2_sidecar_checkpoint_with_no_file_actions() -> DeltaResult<()> {
     let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
     let table_url = delta_kernel::try_parse_uri(&table_path)?;
 
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "value",
-        DataType::INTEGER,
-    )])?);
+    let schema = schema_ref! { nullable "value": INTEGER };
 
     // v2 table, no data commits -> only protocol + metadata at version 0.
     let _ = create_table(&table_path, schema, "Test/1.0")
@@ -851,19 +843,6 @@ async fn test_v2_sidecar_checkpoint_with_no_file_actions() -> DeltaResult<()> {
     Ok(())
 }
 
-/// Reads all parquet record batches from a file, concatenating them into a single batch.
-fn read_parquet_file(path: &std::path::Path) -> RecordBatch {
-    let bytes = std::fs::read(path).expect("failed to read parquet file");
-    let bytes = bytes::Bytes::from(bytes);
-    let reader = ParquetRecordBatchReaderBuilder::try_new(bytes)
-        .expect("failed to create parquet reader")
-        .build()
-        .expect("failed to build reader");
-    let batches: Vec<RecordBatch> = reader.map(|b| b.unwrap()).collect();
-    let schema = batches[0].schema();
-    concat_batches(&schema, &batches).expect("failed to concat batches")
-}
-
 /// Reads the `_last_checkpoint` JSON file from the table's `_delta_log` directory.
 fn read_last_checkpoint(table_path: &str) -> serde_json::Value {
     let path = std::path::Path::new(table_path).join("_delta_log/_last_checkpoint");
@@ -883,7 +862,7 @@ fn read_last_checkpoint(table_path: &str) -> serde_json::Value {
 async fn v2_table_with_domain_metadata_and_txn<E: TaskExecutor>(
     table_path: &str,
     table_url: &url::Url,
-    engine: &Arc<delta_kernel::engine::default::DefaultEngine<E>>,
+    engine: &Arc<test_utils::delta_kernel_default_engine::DefaultEngine<E>>,
 ) -> DeltaResult<Arc<Snapshot>> {
     fn make_info_array(names: &[&str]) -> ArrayRef {
         let name_array: ArrayRef = Arc::new(StringArray::from(
@@ -1140,7 +1119,7 @@ fn assert_sidecars_contain_only_file_actions(
 async fn create_partitioned_stats_table<E: TaskExecutor>(
     table_path: &str,
     table_url: &url::Url,
-    engine: &Arc<delta_kernel::engine::default::DefaultEngine<E>>,
+    engine: &Arc<test_utils::delta_kernel_default_engine::DefaultEngine<E>>,
 ) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
     let schema = Arc::new(StructType::try_new(vec![
         StructField::nullable("id", DataType::LONG),
@@ -1437,6 +1416,7 @@ async fn test_v2_sidecar_preserves_dv_and_row_tracking_on_add(
         .with_table_properties([
             ("delta.feature.v2Checkpoint", "supported"),
             ("delta.feature.deletionVectors", "supported"),
+            ("delta.enableDeletionVectors", "true"),
             ("delta.enableRowTracking", "true"),
         ])
         .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
@@ -1604,7 +1584,7 @@ fn cross_feature_schema() -> Arc<StructType> {
 async fn build_v2_table_with_feature<E: TaskExecutor>(
     table_path: &str,
     table_url: &url::Url,
-    engine: &Arc<delta_kernel::engine::default::DefaultEngine<E>>,
+    engine: &Arc<test_utils::delta_kernel_default_engine::DefaultEngine<E>>,
     features: &[CrossFeature],
 ) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
     let schema = cross_feature_schema();
@@ -1682,4 +1662,89 @@ async fn build_v2_table_with_feature<E: TaskExecutor>(
     }
 
     Ok(snapshot)
+}
+
+/// A version holding two complete checkpoints must load from the uuid-named one, since it outranks
+/// the classic-named one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn snapshot_selects_uuid_checkpoint_over_classic_at_one_version() -> DeltaResult<()> {
+    let (_temp_dir, table_path, engine) = test_table_setup_mt()?;
+    let table_url = delta_kernel::try_parse_uri(&table_path)?;
+
+    let schema = schema_ref! { nullable "value": INTEGER };
+    let _ = create_table(&table_path, schema, "Test/1.0")
+        .with_table_properties([("delta.feature.v2Checkpoint", "supported")])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?;
+
+    let snapshot0 = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let snapshot = insert_data(
+        snapshot0,
+        &engine,
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+    )
+    .await?
+    .unwrap_post_commit_snapshot();
+    let version = snapshot.version();
+
+    // Writes `<version>.checkpoint.parquet` plus a `_last_checkpoint` describing it.
+    snapshot.checkpoint(
+        engine.as_ref(),
+        Some(&CheckpointSpec::V2(V2CheckpointConfig::NoSidecar)),
+    )?;
+
+    // As of v0.27.0 kernel writes only classic names, which this test depends on.
+    let classic_path = load_existing_single_file_checkpoint_path(&table_path, version);
+    assert_eq!(
+        classic_path.file_name().unwrap().to_str().unwrap(),
+        format!("{version:020}.checkpoint.parquet"),
+    );
+
+    // Add a second complete checkpoint at this version, uuid-named so it outranks the classic one.
+    // Kernel's write path cannot produce one, so copy the V2 (classic-named) checkpoint it wrote to
+    // a V2 (uuid-named) path: same contents, and both namings are spec-valid under
+    // `v2Checkpoint`.
+    let uuid_name = format!("{version:020}.checkpoint.{}.parquet", uuid::Uuid::new_v4());
+    let uuid_path = std::path::Path::new(&table_path)
+        .join("_delta_log")
+        .join(&uuid_name);
+    std::fs::copy(&classic_path, &uuid_path).expect("copy classic checkpoint to a uuid name");
+
+    // No path and no `parts` implies the classic checkpoint. Kernel doesn't write the
+    // `v2Checkpoint` field yet (TODO #1052), so a hint can never name a uuid checkpoint.
+    let last_checkpoint = read_last_checkpoint(&table_path);
+    assert_eq!(last_checkpoint["version"].as_u64(), Some(version));
+    assert!(last_checkpoint.get("parts").is_none());
+    assert!(last_checkpoint.get("v2Checkpoint").is_none());
+
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    assert_eq!(snapshot.version(), version);
+
+    let log_segment = snapshot.log_segment();
+    let selected: Vec<&str> = log_segment
+        .listed
+        .checkpoint_parts
+        .iter()
+        .map(|p| p.filename.as_str())
+        .collect();
+    assert_eq!(
+        selected,
+        vec![uuid_name.as_str()],
+        "expected the uuid-named checkpoint to outrank the classic one"
+    );
+    assert_eq!(log_segment.checkpoint_version, Some(version));
+
+    // The hint implies the classic checkpoint, not the selected uuid one, so its fields get
+    // dropped.
+    assert!(log_segment.checkpoint_hint().is_none());
+
+    // Replay returns the rows written above, so the hand-placed copy is a readable checkpoint.
+    let scan = snapshot.scan_builder().build()?;
+    let rows: usize = read_scan(&scan, engine.clone() as Arc<dyn Engine>)?
+        .iter()
+        .map(|b| b.num_rows())
+        .sum();
+    assert_eq!(rows, 3);
+
+    Ok(())
 }

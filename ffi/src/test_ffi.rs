@@ -5,9 +5,9 @@
 use std::sync::Arc;
 
 use delta_kernel::expressions::{
-    column_expr, column_name, column_pred, ArrayData, BinaryExpressionOp, BinaryPredicateOp,
-    Expression as Expr, MapData, OpaqueExpressionOp, OpaquePredicateOp, Predicate as Pred, Scalar,
-    ScalarExpressionEvaluator, StructData, Transform,
+    col, column_name, column_pred, lit, ArrayData, BinaryExpressionOp, BinaryPredicateOp,
+    Expression as Expr, ExpressionStructPatchBuilder, MapData, OpaqueExpressionOp,
+    OpaquePredicateOp, Predicate as Pred, Scalar, ScalarExpressionEvaluator, StructData,
 };
 use delta_kernel::kernel_predicates::{
     DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
@@ -103,32 +103,32 @@ pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpress
     let nested_struct_type = StructType::try_new(nested_fields).unwrap();
 
     let top_level_struct = StructData::try_new(
-        vec![StructField::nullable(
-            "top",
-            DataType::Struct(Box::new(nested_struct_type)),
-        )],
+        vec![StructField::nullable("top", nested_struct_type)],
         vec![Scalar::Struct(nested_struct)],
     )
     .unwrap();
 
-    let nested_transform = Transform::new_top_level()
-        .with_dropped_field("gone")
-        .with_replaced_field("stub", Expr::literal("replaced").into())
-        .with_inserted_field(Some("x".to_string()), Expr::literal(true).into())
-        .with_inserted_field(Some("y".to_string()), Expr::literal(false).into());
-    let top_level_transform = Transform::new_nested(column_name!("foo.bar.baz"))
-        .with_dropped_field("dropme")
-        .with_replaced_field("replaceme", Expr::literal(42).into())
-        .with_inserted_field(None::<&str>, Expr::literal("prepended").into())
-        .with_inserted_field(Some("a".to_string()), Expr::literal("first").into())
-        .with_inserted_field(
-            Some("a".to_string()),
-            Expr::transform(nested_transform).into(),
-        )
-        .with_inserted_field(Some("a".to_string()), Expr::literal("third").into());
+    // NOTE: This convoluted example cannot directly use nested builder helpers, because the fields
+    // of `foo.bar.baz` are hoisted up as the new top-level columns while the original top-level
+    // struct becomes a child of `foo.bar.baz`, inserted after `a`. Which means a hypothetical child
+    // `t` of `foo.bar.baz` will appear twice in the output (as `foo.bar.baz.t` and also as `t`).
+    let nested_patch = ExpressionStructPatchBuilder::new()
+        .drop("gone")
+        .replace("stub", lit("replaced"))
+        .insert_after("x", lit(true))
+        .insert_after("y", lit(false));
+    let top_level_patch = ExpressionStructPatchBuilder::new_nested(column_name!("foo.bar.baz"))
+        .drop("dropme")
+        .replace("replaceme", lit(42))
+        .prepend(lit("prepended"))
+        .insert_after("a", lit("first"))
+        .insert_after("a", Expr::struct_patch(nested_patch).unwrap())
+        .insert_after("a", lit("third"))
+        .append(lit("appended"));
+    let empty_nested_patch = ExpressionStructPatchBuilder::new_nested(column_name!("empty.nested"));
 
     let mut sub_exprs = vec![
-        column_expr!("col"),
+        col!("col"),
         Expr::literal(i8::MAX),
         Expr::literal(i8::MIN),
         Expr::literal(f32::MAX),
@@ -150,7 +150,9 @@ pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpress
         Scalar::decimal((1i128 << 64) + 1, 20, 3).unwrap().into(),
         Expr::null_literal(DataType::SHORT),
         Scalar::Struct(top_level_struct).into(),
-        Expr::Transform(top_level_transform),
+        Expr::struct_patch(top_level_patch).unwrap(),
+        Expr::struct_patch(ExpressionStructPatchBuilder::new()).unwrap(),
+        Expr::struct_patch(empty_nested_patch).unwrap(),
         Scalar::Array(array_data).into(),
         Scalar::Map(map_data).into(),
         Expr::struct_from([Expr::literal(5_i32), Expr::literal(20_i64)]),
@@ -159,7 +161,9 @@ pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpress
             vec![Expr::literal(42), Expr::literal(1.111)],
         ),
         Expr::unknown("mystery"),
-        Expr::map_to_struct(column_expr!("pv")),
+        Expr::map_to_struct(col!("pv")),
+        Expr::coalesce([col!("col"), lit(0_i32)]),
+        Expr::array([Expr::literal(1_i32), Expr::literal(2_i32)]),
     ];
     sub_exprs.extend(
         [
@@ -192,8 +196,8 @@ pub unsafe extern "C" fn get_testing_kernel_predicate() -> Handle<SharedPredicat
 
     let mut sub_exprs = vec![
         column_pred!("col"),
-        Pred::literal(true),
-        Pred::literal(false),
+        Pred::TRUE,
+        Pred::FALSE,
         Pred::binary(
             BinaryPredicateOp::In,
             Expr::literal(10),
@@ -208,7 +212,7 @@ pub unsafe extern "C" fn get_testing_kernel_predicate() -> Handle<SharedPredicat
             Pred::eq(Expr::literal(5), Expr::literal(10)),
             Pred::ne(Expr::literal(20), Expr::literal(10)),
         ]),
-        Pred::is_not_null(column_expr!("col")),
+        Pred::is_not_null(col!("col")),
         Pred::opaque(
             OpaqueTestOp("bar".to_string()),
             vec![Expr::literal(42), Expr::literal(1.111)],
@@ -240,7 +244,7 @@ pub unsafe extern "C" fn get_testing_kernel_predicate() -> Handle<SharedPredicat
 #[no_mangle]
 pub unsafe extern "C" fn get_simple_testing_kernel_expression() -> Handle<SharedExpression> {
     let sub_exprs = vec![
-        column_expr!("simple_col"),
+        col!("simple_col"),
         Expr::literal(42i32),
         Expr::literal(100i64),
         Expr::literal(2.5f64), // Using 2.5 to avoid clippy::approx_constant warning
@@ -250,6 +254,8 @@ pub unsafe extern "C" fn get_simple_testing_kernel_expression() -> Handle<Shared
         Scalar::Date(19000).into(),
         Scalar::Timestamp(1234567890).into(),
         Scalar::TimestampNtz(9876543210).into(),
+        Scalar::IntervalYearMonth(-13).into(),
+        Scalar::IntervalDayTime(9_876_543_210).into(),
         Expr::null_literal(DataType::INTEGER),
         Expr::null_literal(DataType::decimal(10, 5).unwrap()),
         Expr::binary(
@@ -277,7 +283,7 @@ pub unsafe extern "C" fn get_simple_testing_kernel_expression() -> Handle<Shared
             Expr::literal(2_i64),
             Expr::literal(3.0_f64),
         ]),
-        Expr::map_to_struct(column_expr!("partitionValues")),
+        Expr::map_to_struct(col!("partitionValues")),
     ];
     Arc::new(Expr::struct_from(sub_exprs)).into()
 }
@@ -291,8 +297,8 @@ pub unsafe extern "C" fn get_simple_testing_kernel_expression() -> Handle<Shared
 pub unsafe extern "C" fn get_simple_testing_kernel_predicate() -> Handle<SharedPredicate> {
     let sub_preds = vec![
         column_pred!("pred_col"),
-        Pred::literal(true),
-        Pred::literal(false),
+        Pred::TRUE,
+        Pred::FALSE,
         Pred::eq(Expr::literal(10), Expr::literal(10)),
         Pred::ne(Expr::literal(5), Expr::literal(10)),
         Pred::lt(Expr::literal(5), Expr::literal(10)),
@@ -300,9 +306,9 @@ pub unsafe extern "C" fn get_simple_testing_kernel_predicate() -> Handle<SharedP
         Pred::gt(Expr::literal(20), Expr::literal(10)),
         Pred::ge(Expr::literal(10), Expr::literal(10)),
         Pred::distinct(Expr::literal(1), Expr::literal(2)),
-        Pred::is_null(column_expr!("nullable_col")),
-        Pred::is_not_null(column_expr!("nonnull_col")),
-        Pred::not(Pred::literal(false)),
+        Pred::is_null(col!("nullable_col")),
+        Pred::is_not_null(col!("nonnull_col")),
+        Pred::not(Pred::FALSE),
         Pred::or_from(vec![
             Pred::eq(Expr::literal(1), Expr::literal(1)),
             Pred::eq(Expr::literal(2), Expr::literal(2)),

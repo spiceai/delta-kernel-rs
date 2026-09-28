@@ -87,13 +87,15 @@ use self::schema::{DataType, SchemaRef};
 
 mod action_reconciliation;
 pub mod actions;
+pub mod cancellation;
 pub mod checkpoint;
+pub mod commit_range;
 pub mod committer;
-// Public under test-utils so integration tests can inspect CRC state via
-// Snapshot::get_current_crc_if_loaded_for_testing.
-#[cfg(feature = "test-utils")]
+#[cfg(feature = "adaptive-metadata-in-dev")]
+mod content_tree;
+#[cfg(feature = "internal-api")]
 pub mod crc;
-#[cfg(not(feature = "test-utils"))]
+#[cfg(not(feature = "internal-api"))]
 pub(crate) mod crc;
 pub mod engine_data;
 pub mod error;
@@ -104,9 +106,12 @@ mod log_path;
 mod log_reader;
 pub mod metrics;
 pub mod partition;
+#[cfg(feature = "declarative-plans")]
+pub mod plans;
 pub mod scan;
 pub mod schema;
 pub mod snapshot;
+pub mod struct_patch;
 pub mod table_changes;
 pub mod table_configuration;
 pub mod table_features;
@@ -126,7 +131,7 @@ pub(crate) mod row_tracking;
 pub(crate) mod clustering;
 
 mod arrow_compat;
-#[cfg(any(feature = "arrow-57", feature = "arrow-58"))]
+#[cfg(any(feature = "arrow-58", feature = "arrow-59"))]
 pub use arrow_compat::*;
 
 #[cfg(feature = "internal-api")]
@@ -134,10 +139,15 @@ pub mod column_trie;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod column_trie;
 pub mod kernel_predicates;
+#[cfg(test)]
+pub(crate) mod unit_test_utils;
+#[cfg(feature = "internal-api")]
+pub mod utils;
+#[cfg(not(feature = "internal-api"))]
 pub(crate) mod utils;
 
 #[cfg(feature = "internal-api")]
-pub use utils::try_parse_uri;
+pub use utils::{try_parse_uri, CollectInto};
 
 // for the below modules, we cannot introduce a macro to clean this up. rustfmt doesn't follow into
 // macros, and so will not format the files associated with these modules if we get too clever. see:
@@ -163,6 +173,9 @@ pub mod last_checkpoint_hint;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod last_checkpoint_hint;
 
+#[cfg(feature = "internal-api")]
+pub mod log_segment_files;
+#[cfg(not(feature = "internal-api"))]
 pub(crate) mod log_segment_files;
 
 pub mod history_manager;
@@ -173,27 +186,38 @@ pub mod parallel;
 pub(crate) mod parallel;
 
 pub use action_reconciliation::{ActionReconciliationIterator, ActionReconciliationIteratorState};
+use cancellation::check_cancelled;
+pub use cancellation::{CancellationToken, CancellationTokenRef, CancelledFuture};
 pub use delta_kernel_derive;
 use delta_kernel_derive::internal_api;
 pub use engine_data::{
     EngineData, FilteredEngineData, FilteredRowVisitor, GetData, RowIndexIterator, RowVisitor,
 };
-pub use error::{DeltaResult, Error};
+pub use error::{DeltaResult, DeltaResultIterator, DeltaResultIteratorStatic, Error};
 use expressions::{literal_expression_transform, Scalar};
 pub use expressions::{Expression, ExpressionRef, Predicate, PredicateRef};
 pub use log_compaction::{should_compact, LogCompactionWriter};
+#[cfg(feature = "declarative-plans")]
+pub use plans::{IoOperation, Operation, PlanBuilder, PlanExecutor, PlanResult};
 use schema::{StructField, StructType};
 pub use snapshot::{Snapshot, SnapshotRef};
 
 #[cfg(any(
-    feature = "default-engine-native-tls",
-    feature = "default-engine-rustls",
-    feature = "arrow-conversion"
+    feature = "default-engine-base",
+    feature = "arrow-conversion",
+    feature = "declarative-plans"
 ))]
 pub mod engine;
 
 /// Delta table version is 8 byte unsigned int
 pub type Version = u64;
+
+/// Converts a [`Version`] to `i64`, returning an error if the version exceeds `i64::MAX`.
+pub(crate) fn version_as_i64(version: Version) -> DeltaResult<i64> {
+    version
+        .try_into()
+        .map_err(|_| Error::generic(format!("Delta log version {version} exceeds i64::MAX")))
+}
 
 pub type FileSize = u64;
 pub type FileIndex = u64;
@@ -205,8 +229,7 @@ pub type FileSlice = (Url, Option<Range<FileIndex>>);
 pub type FileDataReadResult = (FileMeta, Box<dyn EngineData>);
 
 /// An iterator of data read from specified files
-pub type FileDataReadResultIterator =
-    Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>;
+pub type FileDataReadResultIterator = DeltaResultIteratorStatic<Box<dyn EngineData>>;
 
 /// The metadata that describes an object.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -585,11 +608,20 @@ pub(crate) trait IntoEngineData {
 /// file system where the Delta table is present. Connector implementation of
 /// this trait can hide filesystem specific details from Delta Kernel.
 pub trait StorageHandler: AsAny {
-    /// List the paths in the same directory that are lexicographically greater than
-    /// (UTF-8 sorting) the given `path`. The result should also be sorted by the file name.
+    /// Recursively list files whose full path is lexicographically greater than (UTF-8 sorting)
+    /// the given `path`, restricted to descendants of `path`'s parent directory. The result must
+    /// be sorted by the full path (UTF-8 byte order).
     ///
-    /// If the path is directory-like (ends with '/'), the result should contain
-    /// all the files in the directory.
+    /// The listing is **recursive**: files in nested subdirectories are included, not just files
+    /// directly under the parent. For example, listing from `dir/0001.json` may return
+    /// `dir/0002.json`, `dir/sub/0003.json`, and `dir/sub/nested/0004.json`, all interleaved
+    /// in lexicographic order.
+    ///
+    /// The parent directory is derived from `path`:
+    /// - If `path` is directory-like (ends with `/`), the parent is `path` itself and the result
+    ///   contains all files at or below that directory.
+    /// - Otherwise, the parent is the directory containing `path`, and only files (at any depth
+    ///   under that parent) whose full path sorts strictly greater than `path` are returned.
     fn list_from(&self, path: &Url)
         -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>>;
 
@@ -613,6 +645,12 @@ pub trait StorageHandler: AsAny {
     ///
     /// If the file does not exist, this must return an `Err` with [`Error::FileNotFound`].
     fn head(&self, path: &Url) -> DeltaResult<FileMeta>;
+
+    /// Delete the file at the given path.
+    ///
+    /// This operation is idempotent: deleting a path that does not exist should return `Ok(())`.
+    /// For any other error, this must propagate the corresponding error.
+    fn delete(&self, path: &Url) -> DeltaResult<()>;
 }
 
 /// Provides JSON handling functionality to Delta Kernel.
@@ -651,7 +689,12 @@ pub trait JsonHandler: AsAny {
     ///
     /// - `files` - File metadata for files to be read.
     /// - `physical_schema` - Select list of columns to read from the JSON file.
-    /// - `predicate` - Optional push-down predicate hint (engine is free to ignore it).
+    /// - `predicate` - Optional conservative push-down predicate. Implementations may ignore it. If
+    ///   applied, a file or row may be omitted only when the predicate cannot evaluate to true for
+    ///   any row in that unit. CAST conversion, failure, and NULL semantics must match final
+    ///   filtering over exact row values. Unsupported or missing references remain unknown without
+    ///   failing the read, including references synthesized as NULL columns during schema
+    ///   reconciliation. Returned data is not guaranteed to satisfy the predicate.
     fn read_json_files(
         &self,
         files: &[FileMeta],
@@ -659,9 +702,38 @@ pub trait JsonHandler: AsAny {
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator>;
 
-    /// Atomically (!) write a single JSON file. Each row of the input data should be written as a
-    /// new JSON object appended to the file. this write must:
-    /// (1) serialize the data to newline-delimited json (each row is a json object literal)
+    /// Cancellation-aware variant of [`read_json_files`](Self::read_json_files).
+    ///
+    /// When `cancellation_token` is `Some`, an engine may race its I/O against the token and
+    /// terminate the returned iterator with [`Error::Cancelled`] once cancellation is observed,
+    /// rather than reading every file to completion.
+    ///
+    /// The default implementation returns [`Error::Cancelled`] if the token is already cancelled
+    /// and otherwise delegates to [`read_json_files`](Self::read_json_files), ignoring the token
+    /// for the rest of the read. So an engine that does not override this stays source-compatible
+    /// while still honoring an up-front cancellation; kernel additionally polls the token at
+    /// action-batch boundaries. An engine that overrides this may assume kernel has already
+    /// performed the pre-read check, and should focus on interrupting its in-flight I/O.
+    ///
+    /// [`Error::Cancelled`]: crate::Error::Cancelled
+    fn read_json_files_with_cancellation(
+        &self,
+        files: &[FileMeta],
+        physical_schema: SchemaRef,
+        predicate: Option<PredicateRef>,
+        cancellation_token: Option<CancellationTokenRef>,
+    ) -> DeltaResult<FileDataReadResultIterator> {
+        check_cancelled(cancellation_token.as_ref())?;
+        self.read_json_files(files, physical_schema, predicate)
+    }
+
+    /// Atomically (!) write a single JSON file. Each selected row of the input data must be
+    /// written as a new JSON object appended to the file; rows not selected by a batch's
+    /// selection vector (see [`FilteredEngineData`]) must not be written.
+    /// [`FilteredEngineData::apply_selection_vector`] produces the selected-rows view for
+    /// implementations that do not filter during serialization. This write must:
+    /// (1) serialize the selected rows to newline-delimited json (each row is a json object
+    ///     literal)
     /// (2) write the data to storage atomically (i.e. if the file already exists, fail unless the
     ///     overwrite flag is set)
     ///
@@ -676,15 +748,13 @@ pub trait JsonHandler: AsAny {
     /// # Parameters
     ///
     /// - `path` - URL specifying the location to write the JSON file
-    /// - `data` - Iterator of EngineData to write to the JSON file. Each row should be written as a
-    ///   new JSON object appended to the file. (that is, the file is newline-delimited JSON, and
-    ///   each row is a JSON object on a single line)
+    /// - `data` - Iterator of [`FilteredEngineData`] to write to the JSON file
     /// - `overwrite` - If true, overwrite the file if it exists. If false, the call must fail if
     ///   the file exists.
     fn write_json_file(
         &self,
         path: &Url,
-        data: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
+        data: DeltaResultIterator<'_, FilteredEngineData>,
         overwrite: bool,
     ) -> DeltaResult<()>;
 }
@@ -731,6 +801,16 @@ pub trait ParquetHandler: AsAny {
     ///    field id
     /// 2. **Field Name**: If no field ID is present in the `physical_schema`'s [`StructField`] or
     ///    no matching parquet field ID is found, fall back to matching by column name
+    ///
+    /// # Type coercion
+    ///
+    /// A matched Parquet column whose physical type differs from the `physical_schema`
+    /// [`StructField`] must be coerced to the requested type. In particular, timestamp columns MUST
+    /// be normalized to the protocol specified microsecond precision: a `TIMESTAMP(MILLIS)` (or
+    /// any other non-microsecond unit) column read into a `TIMESTAMP` / `TIMESTAMP_NTZ` field
+    /// must be rescaled to microseconds (a finer unit such as nanosecond is truncated). The
+    /// default engine does this via `arrow::compute::cast` while reordering columns to the
+    /// requested schema.
     ///
     /// # Metadata Columns
     ///
@@ -819,12 +899,22 @@ pub trait ParquetHandler: AsAny {
     ///
     /// - `files` - File metadata for files to be read.
     /// - `physical_schema` - Select list and order of columns to read from the Parquet file.
-    /// - `predicate` - Optional push-down predicate hint (engine is free to ignore it).
+    /// - `predicate` - Optional conservative push-down predicate. Implementations may ignore it. A
+    ///   file, row group, or row may be omitted only when the predicate cannot evaluate to true for
+    ///   any row in that unit. CAST and NULL semantics must agree with the eventual query filter.
+    ///   An evaluator using exact row values may apply the CAST directly. Footer min/max may be
+    ///   cast only when the cast preserves those bounds; otherwise footer evaluation of the CAST
+    ///   must remain unknown and must not fail the read. Other unsupported subexpressions and
+    ///   references with no matching physical or generated value must also remain unknown without
+    ///   failing the read. A missing reference remains unknown for pruning even if schema
+    ///   reconciliation synthesizes a NULL output column. Returned data is not guaranteed to
+    ///   satisfy the predicate.
     ///
     /// # Returns
     /// A [`DeltaResult`] containing a [`FileDataReadResultIterator`].
     /// Each element of the iterator is a [`DeltaResult`] of [`EngineData`]. The [`EngineData`]
-    /// has the contents of `files` and must match the provided `physical_schema`.
+    /// contains rows from `files` after any predicate push-down and must match the provided
+    /// `physical_schema`.
     ///
     /// Note: The [`FileDataReadResultIterator`] must emit data from files in the order that `files`
     /// is given. For example if files ["a", "b"] is provided, then the engine data iterator must
@@ -850,6 +940,31 @@ pub trait ParquetHandler: AsAny {
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator>;
 
+    /// Cancellation-aware variant of [`read_parquet_files`](Self::read_parquet_files).
+    ///
+    /// When `cancellation_token` is `Some`, an engine may race its I/O against the token and
+    /// terminate the returned iterator with [`Error::Cancelled`] once cancellation is observed,
+    /// rather than reading every file to completion.
+    ///
+    /// The default implementation returns [`Error::Cancelled`] if the token is already cancelled
+    /// and otherwise delegates to [`read_parquet_files`](Self::read_parquet_files), ignoring the
+    /// token for the rest of the read. So an engine that does not override this stays
+    /// source-compatible while still honoring an up-front cancellation; kernel additionally polls
+    /// the token at action-batch boundaries. An engine that overrides this may assume kernel has
+    /// already performed the pre-read check, and should focus on interrupting its in-flight I/O.
+    ///
+    /// [`Error::Cancelled`]: crate::Error::Cancelled
+    fn read_parquet_files_with_cancellation(
+        &self,
+        files: &[FileMeta],
+        physical_schema: SchemaRef,
+        predicate: Option<PredicateRef>,
+        cancellation_token: Option<CancellationTokenRef>,
+    ) -> DeltaResult<FileDataReadResultIterator> {
+        check_cancelled(cancellation_token.as_ref())?;
+        self.read_parquet_files(files, physical_schema, predicate)
+    }
+
     /// Write data to a Parquet file at the specified URL.
     ///
     /// This method writes the provided `data` to a Parquet file at the given `url`.
@@ -869,7 +984,7 @@ pub trait ParquetHandler: AsAny {
     ///
     /// **Non-compliance produces files with incorrect `field_id`s**, which may lead to
     /// read failures when column mapping mode is `id` and to failures when converting
-    /// the table to Iceberg.   
+    /// the table to Iceberg.
     ///
     /// # Parameters
     ///
@@ -890,7 +1005,7 @@ pub trait ParquetHandler: AsAny {
     fn write_parquet_file(
         &self,
         location: url::Url,
-        data: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>,
+        data: DeltaResultIteratorStatic<Box<dyn EngineData>>,
     ) -> DeltaResult<()>;
 
     /// Read the footer metadata from a Parquet file without reading the data.
@@ -928,6 +1043,28 @@ pub trait ParquetHandler: AsAny {
     /// [`StructField::get_config_value`]: crate::schema::StructField::get_config_value
     /// [`ColumnMetadataKey::ParquetFieldId`]: crate::schema::ColumnMetadataKey::ParquetFieldId
     fn read_parquet_footer(&self, file: &FileMeta) -> DeltaResult<ParquetFooter>;
+
+    /// Cancellation-aware variant of [`read_parquet_footer`](Self::read_parquet_footer).
+    ///
+    /// When `cancellation_token` is `Some`, an engine may race the footer read against the token
+    /// and return [`Error::Cancelled`] once cancellation is observed.
+    ///
+    /// The default implementation returns [`Error::Cancelled`] if the token is already cancelled
+    /// and otherwise delegates to [`read_parquet_footer`](Self::read_parquet_footer), ignoring the
+    /// token for the rest of the read. So an engine that does not override this stays
+    /// source-compatible while still honoring an up-front cancellation. An engine that overrides
+    /// this may assume kernel has already performed the pre-read check, and should focus on
+    /// interrupting its in-flight I/O.
+    ///
+    /// [`Error::Cancelled`]: crate::Error::Cancelled
+    fn read_parquet_footer_with_cancellation(
+        &self,
+        file: &FileMeta,
+        cancellation_token: Option<CancellationTokenRef>,
+    ) -> DeltaResult<ParquetFooter> {
+        check_cancelled(cancellation_token.as_ref())?;
+        self.read_parquet_footer(file)
+    }
 }
 
 /// The `Engine` trait encapsulates all the functionality an engine or connector needs to provide
@@ -947,22 +1084,27 @@ pub trait Engine: AsAny {
 
     /// Get the connector provided [`ParquetHandler`].
     fn parquet_handler(&self) -> Arc<dyn ParquetHandler>;
-}
 
-// we have an 'internal' feature flag: default-engine-base, which is actually just the shared
-// pieces of default-engine-native-tls and default-engine-rustls. the crate can't compile with
-// _only_ default-engine-base, so we give a friendly error here.
-#[cfg(all(
-    feature = "default-engine-base",
-    not(any(
-        feature = "default-engine-native-tls",
-        feature = "default-engine-rustls",
-    ))
-))]
-compile_error!(
-    "The default-engine-base feature flag is not meant to be used directly. \
-    Please use either default-engine-native-tls or default-engine-rustls."
-);
+    /// Get the connector provided [`PlanExecutor`], or `None` if this engine provides none.
+    ///
+    /// The default implementation returns `None`. A connector opts into plan-based execution by
+    /// overriding this to return its executor.
+    #[cfg(feature = "declarative-plans")]
+    fn plan_executor(&self) -> Option<Arc<dyn PlanExecutor>> {
+        None
+    }
+
+    /// Get the connector provided [`PlanExecutor`], erroring if this engine provides none.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Unsupported`] when [`plan_executor`](Self::plan_executor) is `None`.
+    #[cfg(feature = "declarative-plans")]
+    fn require_plan_executor(&self) -> DeltaResult<Arc<dyn PlanExecutor>> {
+        self.plan_executor()
+            .ok_or_else(|| Error::unsupported("this engine does not provide a PlanExecutor"))
+    }
+}
 
 // Rustdoc's documentation tests can do some things that regular unit tests can't. Here we are
 // using doctests to test macros. Specifically, we are testing for failed macro invocations due

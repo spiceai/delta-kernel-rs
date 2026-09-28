@@ -46,7 +46,7 @@ mod tests {
     use crate::actions::Protocol;
     use crate::schema::{DataType, PrimitiveType, StructField, StructType};
     use crate::table_features::TableFeature;
-    use crate::utils::test_utils::assert_schema_feature_validation;
+    use crate::unit_test_utils::assert_schema_feature_validation;
 
     #[test]
     fn test_timestamp_ntz_feature_validation() {
@@ -62,11 +62,11 @@ mod tests {
             StructField::new("id", DataType::INTEGER, false),
             StructField::new(
                 "nested",
-                DataType::Struct(Box::new(StructType::new_unchecked([StructField::new(
+                StructType::new_unchecked([StructField::new(
                     "inner_ts",
                     DataType::Primitive(PrimitiveType::TimestampNtz),
                     true,
-                )]))),
+                )]),
                 true,
             ),
         ]);

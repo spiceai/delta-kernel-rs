@@ -4,7 +4,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use url::Url;
 
-use super::{put_bytes, read_files};
+use super::{put_bytes, read_files_arrow};
 use crate::arrow::json::ReaderBuilder;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::arrow_utils::{
@@ -15,7 +15,8 @@ use crate::engine_data::FilteredEngineData;
 use crate::object_store::DynObjectStore;
 use crate::schema::SchemaRef;
 use crate::{
-    DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, JsonHandler, PredicateRef,
+    DeltaResult, DeltaResultIterator, EngineData, Error, FileDataReadResultIterator, FileMeta,
+    JsonHandler, PredicateRef,
 };
 
 pub(crate) struct SyncJsonHandler {
@@ -28,7 +29,7 @@ impl SyncJsonHandler {
     }
 }
 
-fn try_create_from_json(
+pub(super) fn try_create_from_json(
     data: Bytes,
     schema: SchemaRef,
     _predicate: Option<PredicateRef>,
@@ -50,13 +51,14 @@ impl JsonHandler for SyncJsonHandler {
         schema: SchemaRef,
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
-        read_files(
+        let iter = read_files_arrow(
             self.store.as_ref(),
             files,
             schema,
             predicate,
             try_create_from_json,
-        )
+        );
+        Ok(Box::new(iter.map(|data| Ok(Box::new(data?) as _))))
     }
 
     fn parse_json(
@@ -70,7 +72,7 @@ impl JsonHandler for SyncJsonHandler {
     fn write_json_file(
         &self,
         path: &Url,
-        data: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
+        data: DeltaResultIterator<'_, FilteredEngineData>,
         overwrite: bool,
     ) -> DeltaResult<()> {
         let buf = to_json_bytes(data)?;
@@ -159,8 +161,11 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn json_handler_file_path_contract() {
-        crate::engine::tests::test_json_handler_file_path_contract(&SyncJsonHandler::new(None));
-    }
+    // TODO(#2618): Restore once the engine contract helpers move to test_utils and SyncEngine can
+    // call them without the kernel-cfg-test cycle issue.
+    //
+    // #[test]
+    // fn json_handler_file_path_contract() {
+    //     test_json_handler_file_path_contract(&SyncJsonHandler::new(None));
+    // }
 }

@@ -10,24 +10,33 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
+use delta_kernel::actions::deletion_vector_writer::{
+    KernelDeletionVector, StreamingDeletionVectorWriter,
+};
+use delta_kernel::actions::{MAX_VALUES, MIN_VALUES};
 use delta_kernel::arrow::array::{Int32Array, StructArray};
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
-use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::object_store::path::Path;
-use delta_kernel::object_store::DynObjectStore;
+use delta_kernel::object_store::{DynObjectStore, ObjectStore, ObjectStoreExt};
 use delta_kernel::parquet::file::reader::{FileReader, SerializedFileReader};
 use delta_kernel::parquet::schema::types::Type as ParquetType;
 use delta_kernel::path::ParsedLogPath;
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use delta_kernel::table_features::ColumnMappingMode;
-use delta_kernel::transaction::CommitResult;
+use delta_kernel::transaction::{CommitResult, Transaction, WriteContext};
 use delta_kernel::{DeltaResult, Engine, Snapshot, Version};
 use serde_json::json;
-use test_utils::{begin_transaction, create_add_files_metadata, create_table, engine_store_setup};
+use test_utils::delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
+use test_utils::delta_kernel_default_engine::DefaultEngine;
+use test_utils::{
+    begin_transaction, create_add_files_metadata, create_table, engine_store_setup,
+    into_record_batch, load_and_begin_transaction, modify_add_file_partition_keys,
+    AddFilePartitionKeyModify,
+};
 use url::Url;
 use uuid::Uuid;
 
@@ -345,19 +354,21 @@ pub fn assert_min_max_stats(
     expected_max: impl Into<serde_json::Value>,
 ) {
     assert_eq!(
-        *resolve_json_path(&stats["minValues"], physical_path),
+        *resolve_json_path(&stats[MIN_VALUES], physical_path),
         expected_min.into()
     );
     assert_eq!(
-        *resolve_json_path(&stats["maxValues"], physical_path),
+        *resolve_json_path(&stats[MAX_VALUES], physical_path),
         expected_max.into()
     );
 }
 
-/// Creates a table with deletion vector support and writes the specified files.
+/// Creates a table with deletion vector support and writes files with `partition_values`.
+/// An empty `partition_values` creates an unpartitioned table.
 pub async fn create_dv_table_with_files(
     table_name: &str,
     schema: Arc<StructType>,
+    partition_values: &[(&str, Option<&str>)],
     file_paths: &[&str],
 ) -> Result<
     (
@@ -370,13 +381,14 @@ pub async fn create_dv_table_with_files(
 > {
     let (store, engine, table_url) = engine_store_setup(table_name, None);
     let engine = Arc::new(engine);
+    let partition_columns: Vec<_> = partition_values.iter().map(|(key, _)| *key).collect();
 
     // Create table with DV support (protocol 3/7 with deletionVectors feature)
     create_table(
         store.clone(),
         table_url.clone(),
         schema.clone(),
-        &[],
+        &partition_columns,
         true, // use_37_protocol
         vec!["deletionVectors"],
         vec!["deletionVectors"],
@@ -406,12 +418,46 @@ pub async fn create_dv_table_with_files(
         })
         .collect();
     let metadata = create_add_files_metadata(add_files_schema, files)?;
+    let metadata = if partition_values.is_empty() {
+        metadata
+    } else {
+        let modifications: Vec<_> = partition_values
+            .iter()
+            .map(|(key, value)| AddFilePartitionKeyModify::Insert { key, value: *value })
+            .collect();
+        Box::new(ArrowEngineData::new(modify_add_file_partition_keys(
+            into_record_batch(metadata),
+            &modifications,
+        )))
+    };
     txn.add_files(metadata);
 
     let _ = txn.commit(engine.as_ref())?;
 
     let paths: Vec<String> = file_paths.iter().map(|&s| s.to_string()).collect();
     Ok((store, engine, table_url, paths))
+}
+
+/// Build a `path -> descriptor` map assigning each file a distinct synthetic DV descriptor.
+pub fn sequential_dv_descriptors(
+    file_paths: &[String],
+) -> HashMap<String, DeletionVectorDescriptor> {
+    file_paths
+        .iter()
+        .enumerate()
+        .map(|(idx, path)| {
+            (
+                path.clone(),
+                DeletionVectorDescriptor {
+                    storage_type: DeletionVectorStorageType::PersistedRelative,
+                    path_or_inline_dv: format!("dv_file_{idx}.bin"),
+                    offset: Some(idx as i32 * 10),
+                    size_in_bytes: 40 + idx as i32,
+                    cardinality: idx as i64 + 1,
+                },
+            )
+        })
+        .collect()
 }
 
 /// Extracts scan files from a snapshot for use in deletion vector updates.
@@ -426,4 +472,34 @@ pub fn get_scan_files(
         .into_iter()
         .map(|sm| sm.scan_files)
         .collect())
+}
+
+/// Serialize a deletion vector, write it to the object store, and return its descriptor.
+pub async fn write_deletion_vector_to_store(
+    store: &Arc<dyn ObjectStore>,
+    write_context: &WriteContext,
+    dv: KernelDeletionVector,
+    prefix: &str,
+) -> Result<DeletionVectorDescriptor, Box<dyn std::error::Error>> {
+    let dv_path = write_context.new_deletion_vector_path(String::from(prefix));
+    let dv_object_path = Path::parse(dv_path.absolute_path()?.path())?;
+
+    let mut dv_buffer = Vec::new();
+    let mut dv_writer = StreamingDeletionVectorWriter::new(&mut dv_buffer);
+    let dv_write_result = dv_writer.write_deletion_vector(dv)?;
+    dv_writer.finalize()?;
+
+    ObjectStoreExt::put(store, &dv_object_path, dv_buffer.into()).await?;
+
+    Ok(dv_write_result.to_descriptor(&dv_path))
+}
+
+/// Begin a transaction set up for deletion vector updates.
+pub fn create_dv_update_transaction(
+    table_url: &Url,
+    engine: &dyn Engine,
+) -> Result<Transaction, Box<dyn std::error::Error>> {
+    Ok(load_and_begin_transaction(table_url.clone(), engine)?
+        .with_engine_info("test engine")
+        .with_operation("DELETE".to_string()))
 }

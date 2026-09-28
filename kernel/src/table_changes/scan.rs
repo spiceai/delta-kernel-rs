@@ -9,12 +9,13 @@ use super::log_replay::{table_changes_action_iter, TableChangesScanMetadata};
 use super::physical_to_logical::{get_cdf_transform_expr, scan_file_physical_schema};
 use super::resolve_dvs::{resolve_scan_file_dv, ResolvedCdfScanFile};
 use super::scan_file::scan_metadata_to_scan_file;
-use super::TableChanges;
+use super::{CdfMode, TableChanges};
 use crate::actions::deletion_vector::split_vector;
 use crate::scan::field_classifiers::CdfTransformFieldClassifier;
 use crate::scan::state_info::StateInfo;
-use crate::scan::{PhysicalPredicate, StatsOutputMode};
+use crate::scan::{PartitionValuesOptions, PhysicalPredicate, StatsOptions};
 use crate::schema::SchemaRef;
+use crate::utils::FoldWithOption as _;
 use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, PredicateRef};
 
 /// The result of building a [`TableChanges`] scan over a table. This can be used to get the change
@@ -29,9 +30,11 @@ pub struct TableChangesScan {
 
 /// This builder constructs a [`TableChangesScan`] that can be used to read the [`TableChanges`]
 /// of a table. [`TableChangesScanBuilder`] allows you to specify a schema to project the columns
-/// or specify a predicate to filter rows in the Change Data Feed. Note that predicates containing
-/// Change Data Feed columns `_change_type`, `_commit_version`, and `_commit_timestamp` are not
-/// currently allowed. See issue [#525](https://github.com/delta-io/delta-kernel-rs/issues/525).
+/// or specify a predicate to filter rows in the Change Data Feed. Predicates referencing the
+/// Change Data Feed columns `_change_type`, `_commit_version`, and `_commit_timestamp` are
+/// accepted but have no filtering effect, because those columns are synthesized during scan
+/// execution rather than read from data files; apply such filters in connector code after the
+/// scan returns. See issue [#525](https://github.com/delta-io/delta-kernel-rs/issues/525).
 ///
 /// Note: There is a lot of shared functionality between [`TableChangesScanBuilder`] and
 /// [`ScanBuilder`].
@@ -41,19 +44,19 @@ pub struct TableChangesScan {
 /// Construct a [`TableChangesScan`] from `table_changes` with a given schema and predicate
 /// ```rust
 /// # use std::sync::Arc;
-/// # use delta_kernel::expressions::{column_expr, Scalar};
+/// # use delta_kernel::expressions::{col, lit};
 /// # use delta_kernel::Predicate;
 /// # use delta_kernel::table_changes::TableChanges;
 /// # let path = "./tests/data/table-with-cdf";
 /// # let url = delta_kernel::try_parse_uri(path).unwrap();
-/// # use delta_kernel::engine::default::{storage::store_from_url, DefaultEngineBuilder};
+/// # use test_utils::delta_kernel_default_engine::{storage::store_from_url, DefaultEngineBuilder};
 /// # let engine = DefaultEngineBuilder::new(store_from_url(&url).unwrap()).build();
 /// # let table_changes = TableChanges::try_new(url, &engine, 0, Some(1)).unwrap();
 /// let schema = table_changes
 ///     .schema()
 ///     .project(&["id", "_commit_version"])
 ///     .unwrap();
-/// let predicate = Arc::new(Predicate::gt(column_expr!("id"), Scalar::from(10)));
+/// let predicate = Arc::new(Predicate::gt(col!("id"), lit(10)));
 /// let scan = table_changes
 ///     .into_scan_builder()
 ///     .with_schema(schema)
@@ -106,18 +109,30 @@ impl TableChangesScanBuilder {
     /// [`TableChangesScan`] type itself can be used to fetch the files and associated metadata
     /// required to perform actual data reads.
     pub fn build(self) -> DeltaResult<TableChangesScan> {
-        // if no schema is provided, use `TableChanges`'s entire (logical) schema (e.g. SELECT *)
-        let logical_schema = self
-            .schema
-            .unwrap_or_else(|| self.table_changes.schema.clone().into());
+        // Row-tracking CDF requires row-level reconciliation by row IDs, which this
+        // scanner does not perform.
+        if self.table_changes.mode != CdfMode::ChangeDataFeed {
+            return Err(Error::unsupported(
+                "A row-tracking TableChanges cannot be scanned for data; use \
+                 TableChanges::scan_file_listing instead",
+            ));
+        }
+        // Predicates may reference any column in the full CDF-extended schema even when
+        // `with_schema` narrows the output. Resolve predicate columns against the full schema
+        // so valid references to unprojected columns aren't rejected.
+        let table_schema: SchemaRef = self.table_changes.schema().clone().into();
+        // If no projection is supplied, default to the full CDF-extended schema (SELECT *).
+        let logical_read_schema = self.schema.unwrap_or_else(|| table_schema.clone());
 
         // Create StateInfo using CDF field classifier
         // CDF doesn't support stats output
         let state_info = StateInfo::try_new(
-            logical_schema,
+            logical_read_schema,
+            table_schema,
             self.table_changes.end_snapshot.table_configuration(),
             self.predicate,
-            StatsOutputMode::default(),
+            &StatsOptions::default(),
+            &PartitionValuesOptions::default(),
             CdfTransformFieldClassifier,
         )?;
 
@@ -277,7 +292,7 @@ fn read_scan_file(
 
     let result = read_result_iter.map(move |batch| -> DeltaResult<_> {
         let batch = batch?;
-        // Transform the physical data into the correct logical form, or pass through unchanged
+        // Transform the physical data into the correct logical form, or pass through unchanged.
         let logical = if let Some(ref eval) = phys_to_logical_eval {
             eval.evaluate(batch.as_ref())
         } else {
@@ -315,10 +330,21 @@ fn read_scan_file(
         // because the selection vector is `None`.
         let extend = Some(!is_dv_resolved_pair);
         let rest = split_vector(sv.as_mut(), len, extend);
-        let result = match sv {
-            Some(sv) => logical.and_then(|data| data.apply_selection_vector(sv)),
-            None => logical,
+
+        // If sv is None here, but we used to have one (is_dv_resolved_pair == true) it means we've
+        // split the selection vector beyond the range of the original. split_vector will return
+        // None for rest in that case. When we try and extend that None we still get None, but in
+        // the CDF case we actually DO want to filter out those rows because it means nothing has
+        // changed. Hence, in the case that sv==None and is_dv_resolved_pair==true we need a
+        // full array of false. This only applies to remove/add cases where the associated
+        // pair may have a selection vector that crosses batch sizes.
+        let sv = match sv {
+            None if is_dv_resolved_pair => Some(vec![false; len]),
+            other => other,
         };
+        let result = logical.fold_with(sv, |logical, sv| {
+            logical.and_then(|data| data.apply_selection_vector(sv))
+        });
         selection_vector = rest;
         result
     });
@@ -329,12 +355,15 @@ fn read_scan_file(
 mod tests {
     use std::sync::Arc;
 
+    use crate::committer::FileSystemCommitter;
     use crate::engine::sync::SyncEngine;
-    use crate::expressions::{column_expr, Scalar};
+    use crate::expressions::{col, lit};
+    use crate::object_store::memory::InMemory;
     use crate::scan::transform_spec::FieldTransformSpec;
     use crate::scan::PhysicalPredicate;
     use crate::schema::{DataType, StructField, StructType};
     use crate::table_changes::{TableChanges, COMMIT_VERSION_COL_NAME};
+    use crate::transaction::create_table::create_table;
     use crate::Predicate;
 
     #[test]
@@ -408,7 +437,7 @@ mod tests {
             .schema()
             .project(&["id", COMMIT_VERSION_COL_NAME])
             .unwrap();
-        let predicate = Arc::new(Predicate::gt(column_expr!("id"), Scalar::from(10)));
+        let predicate = Arc::new(Predicate::gt(col!("id"), lit(10)));
         let scan = table_changes
             .into_scan_builder()
             .with_schema(schema.clone())
@@ -454,6 +483,72 @@ mod tests {
         assert!(matches!(&scan.state_info.physical_predicate,
             PhysicalPredicate::Some(pred, pred_schema)
             if pred == &predicate && pred_schema.fields().len() == 1
+        ));
+    }
+
+    // Regression for issue #2468 on the CDF path
+    #[test]
+    fn cdf_predicate_on_unprojected_data_column_in_table_schema_succeeds() {
+        let url_str = "memory:///test_table/";
+        let store = Arc::new(InMemory::new());
+        let engine = SyncEngine::new_with_store(store);
+
+        let schema = Arc::new(StructType::new_unchecked([
+            StructField::nullable("id", DataType::INTEGER),
+            StructField::nullable("part", DataType::STRING),
+        ]));
+        create_table(url_str, schema, "DefaultEngine")
+            .with_table_properties([("delta.enableChangeDataFeed", "true")])
+            .build(&engine, Box::new(FileSystemCommitter::new()))
+            .unwrap()
+            .commit(&engine)
+            .unwrap()
+            .unwrap_committed();
+
+        let url = url::Url::parse(url_str).unwrap();
+        // This regression validates predicate resolution at build time, which is independent
+        // of the CDF version span. A wider range would require a second commit with real
+        // change data (see LocalMockTable).
+        let table_changes = TableChanges::try_new(url, &engine, 0, Some(0)).unwrap();
+
+        // Project only "part"; predicate references unprojected "id".
+        let schema = table_changes.schema().project(&["part"]).unwrap();
+        let predicate = Arc::new(Predicate::gt(col!("id"), lit(10)));
+        let scan = table_changes
+            .into_scan_builder()
+            .with_schema(schema)
+            .with_predicate(predicate.clone())
+            .build()
+            .unwrap();
+
+        assert_eq!(scan.logical_schema().fields().len(), 1);
+        assert!(matches!(&scan.state_info.physical_predicate,
+            PhysicalPredicate::Some(pred, _) if pred == &predicate));
+    }
+
+    // See delta-io/delta-kernel-rs#525
+    #[test]
+    fn cdf_predicate_on_unprojected_cdf_metadata_column_builds_but_is_no_op() {
+        let path = "./tests/data/table-with-cdf";
+        let engine = Box::new(SyncEngine::new());
+        let url = delta_kernel::try_parse_uri(path).unwrap();
+        let table_changes = TableChanges::try_new(url, engine.as_ref(), 0, Some(1)).unwrap();
+
+        // Project only "id"; predicate references unprojected `_commit_version`.
+        let schema = table_changes.schema().project(&["id"]).unwrap();
+        let predicate = Arc::new(Predicate::ge(col!("_commit_version"), lit(0_i64)));
+        let scan = table_changes
+            .into_scan_builder()
+            .with_schema(schema)
+            .with_predicate(predicate)
+            .build()
+            .unwrap();
+
+        // Predicate must pass build-time validation. Downstream behavior (no-op for CDF
+        // metadata predicates) is enforced elsewhere.
+        assert!(matches!(
+            &scan.state_info.physical_predicate,
+            PhysicalPredicate::Some(_, _)
         ));
     }
 }

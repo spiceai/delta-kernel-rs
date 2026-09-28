@@ -4,9 +4,9 @@ use std::ffi::c_void;
 
 use delta_kernel::expressions::{
     ArrayData, BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp,
-    ColumnName, Expression, ExpressionRef, JunctionPredicate, JunctionPredicateOp, MapData,
-    MapToStructExpression, OpaqueExpression, OpaqueExpressionOpRef, OpaquePredicate,
-    OpaquePredicateOpRef, ParseJsonExpression, Predicate, Scalar, StructData, Transform,
+    ColumnName, Expression, ExpressionRef, ExpressionStructPatch, JunctionPredicate,
+    JunctionPredicateOp, MapData, MapToStructExpression, OpaqueExpression, OpaqueExpressionOpRef,
+    OpaquePredicate, OpaquePredicateOpRef, ParseJsonExpression, Predicate, Scalar, StructData,
     UnaryExpression, UnaryExpressionOp, UnaryPredicate, UnaryPredicateOp, VariadicExpression,
     VariadicExpressionOp,
 };
@@ -93,6 +93,10 @@ pub struct EngineExpressionVisitor {
     /// Visit a 32bit integer `date` representing days since UNIX epoch 1970-01-01.  The `date`
     /// belongs to the list identified by `sibling_list_id`.
     pub visit_literal_date: VisitLiteralFn<i32>,
+    /// Visit an `interval year to month` literal as a signed month count.
+    pub visit_literal_interval_year_month: VisitLiteralFn<i32>,
+    /// Visit an `interval day to second` literal as a signed microsecond count.
+    pub visit_literal_interval_day_time: VisitLiteralFn<i64>,
     /// Visit binary data at the `buffer` with length `len` belonging to the list identified by
     /// `sibling_list_id`.
     pub visit_literal_binary:
@@ -132,10 +136,9 @@ pub struct EngineExpressionVisitor {
     ),
     /// Visits a typed null value belonging to the list identified by `sibling_list_id`.
     ///
-    /// The `type_tag` identifies the data type using the `NullTypeTag` encoding. For decimal
-    /// nulls (`type_tag == 12`), `precision` and `scale` carry the decimal type parameters;
-    /// for all other types, they are zero. Non-primitive types (struct, array, map, variant)
-    /// use `type_tag == 255`.
+    /// The `type_tag` identifies reconstructible primitive types with tags 0-14. Decimal nulls
+    /// use tag 12 with `precision` and `scale`; interval year-month and day-time nulls use tags
+    /// 13 and 14. Non-primitive types and `void` use the sentinel tag 255.
     pub visit_literal_null: extern "C" fn(
         data: *mut c_void,
         sibling_list_id: usize,
@@ -156,7 +159,9 @@ pub struct EngineExpressionVisitor {
     /// The sub-expression will be in a _one_ item list identified by `child_list_id`
     pub visit_is_null: VisitUnaryFn,
     /// Visits the `ToJson` unary operator belonging to the list identified by `sibling_list_id`.
-    /// The sub-expression will be in a _one_ item list identified by `child_list_id`
+    /// The sub-expression will be in a _one_ item list identified by `child_list_id`.
+    /// See [`UnaryExpressionOp::ToJson`] for the encoding the implementation must produce; in
+    /// particular, timestamps carry exactly three fractional digits, truncated.
     pub visit_to_json: VisitUnaryFn,
     /// Visits the `ParseJson` expression belonging to the list identified by `sibling_list_id`.
     /// The sub-expression (JSON string) will be in a _one_ item list identified by
@@ -201,6 +206,10 @@ pub struct EngineExpressionVisitor {
     /// Visits the `Coalesce` variadic operator belonging to the list identified by
     /// `sibling_list_id`. The operands will be in a list identified by `child_list_id`
     pub visit_coalesce: VisitVariadicFn,
+    /// Visits the `Array` variadic constructor belonging to the list identified by
+    /// `sibling_list_id`. The element expressions will be in a list identified by
+    /// `child_list_id`.
+    pub visit_array: VisitVariadicFn,
     /// Visits the `column` belonging to the list identified by `sibling_list_id`.
     pub visit_column:
         extern "C" fn(data: *mut c_void, sibling_list_id: usize, name: KernelStringSlice),
@@ -208,49 +217,35 @@ pub struct EngineExpressionVisitor {
     /// The sub-expressions (fields) of the struct are in a list identified by `child_list_id`
     pub visit_struct_expr:
         extern "C" fn(data: *mut c_void, sibling_list_id: usize, child_list_id: usize),
-    /// Visits a `Transform` expression belonging to the list identified by `sibling_list_id`. The
-    /// `input_path_list_id` is a single-item list containing transform's input path as a column
-    /// reference (0 = no path). The `field_transform_list_id` identifies the list of field
-    /// transforms to apply (0 = identity transform). See also [`Self::visit_field_transform`].
-    pub visit_transform_expr: extern "C" fn(
+    /// Visits a `StructPatch` expression belonging to the list identified by `sibling_list_id`.
+    /// The `input_path_list_id` is a zero-or-one item list containing the patch's input path as a
+    /// column reference. The `prepended_field_list_id` and `appended_field_list_id` identify
+    /// expression lists to emit before and after the named input fields. The
+    /// `field_patch_list_id` identifies the list of named field patches to apply. See also
+    /// [`Self::visit_field_patch`].
+    pub visit_struct_patch_expr: extern "C" fn(
         data: *mut c_void,
         sibling_list_id: usize,
         input_path_list_id: usize,
-        field_transform_list_id: usize,
+        prepended_field_list_id: usize,
+        field_patch_list_id: usize,
+        appended_field_list_id: usize,
     ),
-    /// Visits one field transform of a `Transform` expression that owns the list identified by
-    /// `sibling_list_id`. Each field transform has a different insertion point (no duplicates).
+    /// Visits one named field patch of a `StructPatch` expression that owns the list identified by
+    /// `sibling_list_id`.
     ///
-    /// A field transform is modeled as the triple `(field_name, expr_list, is_replace)`, as
-    /// described by the truth table below. The `expr_list_id` identifies the list of expressions
-    /// the field transform should emit. The field name (if present) always references a field of
-    /// the input struct. Both the field name and the expression list are optional:
-    ///
-    /// |field_name? |expr_list? |is_replace? |meaning|
-    /// |-|-|-|-|
-    /// | NO  | NO  | *   | NO-OP (prepend an empty list of expressions to the output)
-    /// | NO  | YES | *   | Prepend a list of expressions to the output
-    /// | YES | NO  | NO  | NO-OP (insert an empty list of expressions after the named input field)
-    /// | YES | NO  | YES | Drop the named input field
-    /// | YES | YES | NO  | Insert a list of expressions after the named input field
-    /// | YES | YES | YES | Replace the named input field with a list of expressions
-    ///
-    /// NOTE: Treating list id 0 as an empty list yields a simplified truth table:
-    ///
-    /// |field_name? |is_replace? |meaning|
-    /// |-|-|-|
-    /// | NO  | *   | Prepend a (possibly empty) list of expressions to the output
-    /// | YES | NO  | Insert a (possibly empty)  list of expressions after the named input field
-    /// | YES | YES | Replace the named input field with a (possibly empty) list of expressions
-    ///
-    /// NOTE: The expressions of each field transform must be emitted in order at the insertion
-    /// point.
-    pub visit_field_transform: extern "C" fn(
+    /// The `insertion_expr_list_id` identifies expressions to emit after this field's output
+    /// position. If `keep_input` is true, the original input field is emitted before these
+    /// insertions. If `keep_input` is false, the original input field is omitted and the first
+    /// insertion, if present, occupies the input field's output position. The `optional` flag
+    /// indicates that the patch is silently ignored when the input field does not exist.
+    pub visit_field_patch: extern "C" fn(
         data: *mut c_void,
         sibling_list_id: usize,
-        field_name: *const KernelStringSlice,
-        expr_list_id: usize,
-        is_replace: bool,
+        field_name: KernelStringSlice,
+        insertion_expr_list_id: usize,
+        keep_input: bool,
+        optional: bool,
     ),
     /// Visits the operator (`op`) and children (`child_list_id`) of an opaque expression belonging
     /// to the list identified by `sibling_list_id`.
@@ -421,77 +416,58 @@ fn visit_expression_struct(
     exprs: &[ExpressionRef],
     sibling_list_id: usize,
 ) {
+    let child_list_id = visit_expression_list(visitor, exprs);
+    call!(visitor, visit_struct_expr, sibling_list_id, child_list_id)
+}
+
+fn visit_expression_list(visitor: &mut EngineExpressionVisitor, exprs: &[ExpressionRef]) -> usize {
     let child_list_id = call!(visitor, make_field_list, exprs.len());
     for expr in exprs {
         visit_expression_impl(visitor, expr, child_list_id);
     }
-    call!(visitor, visit_struct_expr, sibling_list_id, child_list_id)
+    child_list_id
 }
 
-fn visit_expression_transform(
+fn visit_expression_struct_patch(
     visitor: &mut EngineExpressionVisitor,
-    transform: &Transform,
+    patch: &ExpressionStructPatch,
     sibling_list_id: usize,
 ) {
-    let Transform {
-        input_path,
-        field_transforms,
-        prepended_fields,
-    } = transform;
-
-    // Treat the input path like a column expression
-    let mut path_list_id = 0;
-    if let Some(ref column_name) = input_path {
-        path_list_id = call!(visitor, make_field_list, 1);
+    // Treat the input path like a zero-or-one column expression list.
+    let path_len = usize::from(patch.input_path.is_some());
+    let path_list_id = call!(visitor, make_field_list, path_len);
+    if let Some(ref column_name) = patch.input_path {
         visit_expression_column(visitor, column_name, path_list_id);
     };
 
-    // Emit one field transform for each named input field (ignoring no-ops), plus one more for the
-    // prepended field list (if any).
-    let prepended_count = if prepended_fields.is_empty() { 0 } else { 1 };
-    let field_transform_count = prepended_count + field_transforms.len();
-    let field_transform_list_id = call!(visitor, make_field_list, field_transform_count);
+    let prepended_field_list_id = visit_expression_list(visitor, &patch.prepended_fields);
+    let appended_field_list_id = visit_expression_list(visitor, &patch.appended_fields);
 
-    // Process the prepend first (if any)
-    if !prepended_fields.is_empty() {
-        let child_list_id = call!(visitor, make_field_list, prepended_fields.len());
-        for expr in prepended_fields {
-            visit_expression_impl(visitor, expr, child_list_id);
-        }
+    // Process each named field patch in turn. Field patch order is not semantically meaningful;
+    // engines should apply field patches according to input schema order.
+    let field_patch_list_id = call!(visitor, make_field_list, patch.field_patches.len());
+    for (field_name, field_patch) in &patch.field_patches {
+        let insertion_expr_list_id = visit_expression_list(visitor, &field_patch.insertions);
         call!(
             visitor,
-            visit_field_transform,
-            field_transform_list_id,
-            std::ptr::null(),
-            child_list_id,
-            false // doesn't matter, no field name
+            visit_field_patch,
+            field_patch_list_id,
+            kernel_string_slice!(field_name),
+            insertion_expr_list_id,
+            field_patch.keep_input,
+            field_patch.optional
         );
     }
 
-    // Process each field transform in turn
-    for (field_name, field_transform) in field_transforms {
-        let child_list_id = call!(visitor, make_field_list, field_transform.exprs.len());
-        for expr in &field_transform.exprs {
-            visit_expression_impl(visitor, expr, child_list_id);
-        }
-
-        call!(
-            visitor,
-            visit_field_transform,
-            field_transform_list_id,
-            &kernel_string_slice!(field_name),
-            child_list_id,
-            field_transform.is_replace
-        );
-    }
-
-    // Attach the field transforms to the parent transform
+    // Attach the field patches to the parent struct patch.
     call!(
         visitor,
-        visit_transform_expr,
+        visit_struct_patch_expr,
         sibling_list_id,
         path_list_id,
-        field_transform_list_id
+        prepended_field_list_id,
+        field_patch_list_id,
+        appended_field_list_id
     );
 }
 
@@ -617,6 +593,22 @@ fn visit_expression_scalar(
                 scale
             )
         }
+        Scalar::IntervalYearMonth(val) => {
+            call!(
+                visitor,
+                visit_literal_interval_year_month,
+                sibling_list_id,
+                *val
+            )
+        }
+        Scalar::IntervalDayTime(val) => {
+            call!(
+                visitor,
+                visit_literal_interval_day_time,
+                sibling_list_id,
+                *val
+            )
+        }
         Scalar::Struct(struct_data) => {
             visit_expression_struct_literal(visitor, struct_data, sibling_list_id)
         }
@@ -634,8 +626,8 @@ fn visit_expression_impl(
         Expression::Literal(scalar) => visit_expression_scalar(visitor, scalar, sibling_list_id),
         Expression::Column(name) => visit_expression_column(visitor, name, sibling_list_id),
         Expression::Struct(exprs, _) => visit_expression_struct(visitor, exprs, sibling_list_id),
-        Expression::Transform(transform) => {
-            visit_expression_transform(visitor, transform, sibling_list_id)
+        Expression::StructPatch(patch) => {
+            visit_expression_struct_patch(visitor, patch, sibling_list_id)
         }
         Expression::Predicate(pred) => visit_predicate_impl(visitor, pred, sibling_list_id),
         Expression::Unary(UnaryExpression { op, expr }) => {
@@ -665,6 +657,7 @@ fn visit_expression_impl(
             }
             let visit_fn = match op {
                 VariadicExpressionOp::Coalesce => visitor.visit_coalesce,
+                VariadicExpressionOp::Array => visitor.visit_array,
             };
             visit_fn(visitor.data, sibling_list_id, child_list_id);
         }
@@ -691,6 +684,12 @@ fn visit_expression_impl(
             visit_expression_impl(visitor, map_expr, child_list_id);
             call!(visitor, visit_map_to_struct, sibling_list_id, child_list_id);
         }
+        // TODO(#2975): Add a dedicated visitor callback for cast expressions.
+        Expression::Cast(cast) => visit_unknown(
+            visitor,
+            sibling_list_id,
+            &format!("cast_to_{}", cast.target),
+        ),
         Expression::Unknown(name) => visit_unknown(visitor, sibling_list_id, name),
     }
 }
@@ -751,4 +750,184 @@ fn visit_predicate_internal(predicate: &Predicate, visitor: &mut EngineExpressio
     let top_level = call!(visitor, make_field_list, 1);
     visit_predicate_impl(visitor, predicate, top_level);
     top_level
+}
+
+#[cfg(test)]
+mod tests {
+    use delta_kernel::expressions::{Expression, Scalar};
+    use rstest::rstest;
+
+    use super::*;
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum LiteralEvent {
+        IntervalYearMonth { sibling_list_id: usize, value: i32 },
+        IntervalDayTime { sibling_list_id: usize, value: i64 },
+    }
+
+    #[derive(Default)]
+    struct TestExpressionBuilder {
+        next_list_id: usize,
+        events: Vec<LiteralEvent>,
+    }
+
+    extern "C" fn make_field_list(data: *mut c_void, _reserve: usize) -> usize {
+        let builder = unsafe { &mut *(data as *mut TestExpressionBuilder) };
+        let list_id = builder.next_list_id;
+        builder.next_list_id += 1;
+        list_id
+    }
+
+    extern "C" fn visit_literal_interval_year_month(
+        data: *mut c_void,
+        sibling_list_id: usize,
+        value: i32,
+    ) {
+        let builder = unsafe { &mut *(data as *mut TestExpressionBuilder) };
+        builder.events.push(LiteralEvent::IntervalYearMonth {
+            sibling_list_id,
+            value,
+        });
+    }
+
+    extern "C" fn visit_literal_interval_day_time(
+        data: *mut c_void,
+        sibling_list_id: usize,
+        value: i64,
+    ) {
+        let builder = unsafe { &mut *(data as *mut TestExpressionBuilder) };
+        builder.events.push(LiteralEvent::IntervalDayTime {
+            sibling_list_id,
+            value,
+        });
+    }
+
+    macro_rules! ignore_fn {
+        ($fn_name:ident $(, $arg_type:ty)*) => {
+            extern "C" fn $fn_name(
+                _data: *mut c_void,
+                _sibling_list_id: usize,
+                $(_: $arg_type),*
+            ) {
+            }
+        };
+    }
+
+    ignore_fn!(ignore_i32, i32);
+    ignore_fn!(ignore_i64, i64);
+    ignore_fn!(ignore_i16, i16);
+    ignore_fn!(ignore_i8, i8);
+    ignore_fn!(ignore_f32, f32);
+    ignore_fn!(ignore_f64, f64);
+    ignore_fn!(ignore_bool, bool);
+    ignore_fn!(ignore_string_slice, KernelStringSlice);
+    ignore_fn!(ignore_binary, *const u8, usize);
+    ignore_fn!(ignore_decimal, i64, u64, u8, u8);
+    ignore_fn!(ignore_struct_literal, usize, usize);
+    ignore_fn!(ignore_child_list, usize);
+    ignore_fn!(ignore_map_literal, usize, usize);
+    ignore_fn!(ignore_null, u8, u8, u8);
+    ignore_fn!(ignore_parse_json, usize, Handle<SharedSchema>);
+    ignore_fn!(ignore_column, KernelStringSlice);
+    ignore_fn!(ignore_struct_patch, usize, usize, usize, usize);
+    ignore_fn!(ignore_field_patch, KernelStringSlice, usize, bool, bool);
+    ignore_fn!(ignore_opaque_expr, Handle<SharedOpaqueExpressionOp>, usize);
+    ignore_fn!(ignore_opaque_pred, Handle<SharedOpaquePredicateOp>, usize);
+
+    fn test_visitor(builder: &mut TestExpressionBuilder) -> EngineExpressionVisitor {
+        EngineExpressionVisitor {
+            data: builder as *mut _ as *mut c_void,
+            make_field_list,
+            visit_literal_int: ignore_i32,
+            visit_literal_long: ignore_i64,
+            visit_literal_short: ignore_i16,
+            visit_literal_byte: ignore_i8,
+            visit_literal_float: ignore_f32,
+            visit_literal_double: ignore_f64,
+            visit_literal_string: ignore_string_slice,
+            visit_literal_bool: ignore_bool,
+            visit_literal_timestamp: ignore_i64,
+            visit_literal_timestamp_ntz: ignore_i64,
+            visit_literal_date: ignore_i32,
+            visit_literal_interval_year_month,
+            visit_literal_interval_day_time,
+            visit_literal_binary: ignore_binary,
+            visit_literal_decimal: ignore_decimal,
+            visit_literal_struct: ignore_struct_literal,
+            visit_literal_array: ignore_child_list,
+            visit_literal_map: ignore_map_literal,
+            visit_literal_null: ignore_null,
+            visit_and: ignore_child_list,
+            visit_or: ignore_child_list,
+            visit_not: ignore_child_list,
+            visit_is_null: ignore_child_list,
+            visit_to_json: ignore_child_list,
+            visit_parse_json: ignore_parse_json,
+            visit_map_to_struct: ignore_child_list,
+            visit_lt: ignore_child_list,
+            visit_gt: ignore_child_list,
+            visit_eq: ignore_child_list,
+            visit_distinct: ignore_child_list,
+            visit_in: ignore_child_list,
+            visit_add: ignore_child_list,
+            visit_minus: ignore_child_list,
+            visit_multiply: ignore_child_list,
+            visit_divide: ignore_child_list,
+            visit_coalesce: ignore_child_list,
+            visit_array: ignore_child_list,
+            visit_column: ignore_column,
+            visit_struct_expr: ignore_child_list,
+            visit_struct_patch_expr: ignore_struct_patch,
+            visit_field_patch: ignore_field_patch,
+            visit_opaque_expr: ignore_opaque_expr,
+            visit_opaque_pred: ignore_opaque_pred,
+            visit_unknown: ignore_column,
+        }
+    }
+
+    #[rstest]
+    #[case(
+        Expression::literal(Scalar::IntervalYearMonth(26)),
+        LiteralEvent::IntervalYearMonth { sibling_list_id: 0, value: 26 }
+    )]
+    #[case(
+        Expression::literal(Scalar::IntervalDayTime(987_654)),
+        LiteralEvent::IntervalDayTime { sibling_list_id: 0, value: 987_654 }
+    )]
+    #[case(
+        Expression::literal(Scalar::IntervalYearMonth(-13)),
+        LiteralEvent::IntervalYearMonth { sibling_list_id: 0, value: -13 }
+    )]
+    #[case(
+        Expression::literal(Scalar::IntervalYearMonth(i32::MIN)),
+        LiteralEvent::IntervalYearMonth { sibling_list_id: 0, value: i32::MIN }
+    )]
+    #[case(
+        Expression::literal(Scalar::IntervalYearMonth(i32::MAX)),
+        LiteralEvent::IntervalYearMonth { sibling_list_id: 0, value: i32::MAX }
+    )]
+    #[case(
+        Expression::literal(Scalar::IntervalDayTime(-86_400_000_000)),
+        LiteralEvent::IntervalDayTime { sibling_list_id: 0, value: -86_400_000_000 }
+    )]
+    #[case(
+        Expression::literal(Scalar::IntervalDayTime(i64::MIN)),
+        LiteralEvent::IntervalDayTime { sibling_list_id: 0, value: i64::MIN }
+    )]
+    #[case(
+        Expression::literal(Scalar::IntervalDayTime(i64::MAX)),
+        LiteralEvent::IntervalDayTime { sibling_list_id: 0, value: i64::MAX }
+    )]
+    fn visit_expression_uses_interval_literal_callbacks(
+        #[case] expression: Expression,
+        #[case] expected: LiteralEvent,
+    ) {
+        let mut builder = TestExpressionBuilder::default();
+        let mut visitor = test_visitor(&mut builder);
+
+        let top_level_id = visit_expression_internal(&expression, &mut visitor);
+
+        assert_eq!(top_level_id, 0);
+        assert_eq!(builder.events, vec![expected]);
+    }
 }

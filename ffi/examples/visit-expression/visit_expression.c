@@ -91,7 +91,7 @@ int main() {
         "This test demonstrates the full range of expression types.\n"
         "Some types are not yet supported in round-trip reconstruction:\n"
         "  - Struct/Array/Map literals (nested data structures)\n"
-        "  - Transform expressions (schema evolution operations)\n"
+        "  - StructPatch expressions (struct transformation operations)\n"
         "  - Opaque expressions (custom user-defined expressions)"
     },
     {
@@ -102,8 +102,8 @@ int main() {
       .description = 
         "This test validates expressions/predicates with full support.\n"
         "Supported types: primitives (int, long, float, double, bool, "
-        "string),\n  temporal (date, timestamp, timestamp_ntz), binary, "
-        "decimal, null,\n  binary operations (+, -, *, /), struct "
+        "string),\n  temporal (date, timestamp, timestamp_ntz), intervals, "
+        "binary, decimal, null,\n  binary operations (+, -, *, /), struct "
         "expressions, predicates (eq, ne, lt, le,\n  gt, ge, distinct, "
         "is_null, is_not_null, not, and, or)"
     }

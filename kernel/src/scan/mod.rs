@@ -15,18 +15,23 @@ use self::log_replay::{get_scan_metadata_transform_expr, scan_action_iter};
 use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
 };
-use crate::actions::{get_commit_schema, Add, ADD_NAME, REMOVE_NAME};
+use crate::actions::{Add, ADD_FIELD, ADD_NAME, NULL_COUNT, REMOVE_FIELD};
+use crate::cancellation::{CancellableIterator, CancellationTokenRef};
+#[cfg(feature = "declarative-plans")]
+use crate::checkpoint::CheckpointShape;
 use crate::engine_data::FilteredEngineData;
-use crate::expressions::{ColumnName, ExpressionRef, Predicate, PredicateRef, Scalar};
+use crate::expressions::{column_name, ColumnName, ExpressionRef, Predicate, PredicateRef, Scalar};
 use crate::kernel_predicates::{
     DefaultKernelPredicateEvaluator, EmptyColumnResolver, KernelPredicateEvaluator as _,
 };
 use crate::log_replay::{ActionsBatch, HasSelectionVector};
 use crate::log_segment::{ActionsWithCheckpointInfo, CheckpointReadInfo, LogSegment};
 use crate::log_segment_files::LogSegmentFiles;
-use crate::metrics::reporter::emit_scan_metadata_completed;
+use crate::metrics::events::emit_scan_metadata_completed;
 use crate::metrics::{MetricId, ScanType};
 use crate::parallel::sequential_phase::SequentialPhase;
+#[cfg(feature = "declarative-plans")]
+use crate::plans::ir::plan::Plan;
 use crate::scan::log_replay::{
     ScanLogReplayProcessor, BASE_ROW_ID_NAME, CLUSTERING_PROVIDER_NAME,
     DEFAULT_ROW_COMMIT_VERSION_NAME,
@@ -34,18 +39,21 @@ use crate::scan::log_replay::{
 use crate::scan::metrics::ScanMetrics;
 use crate::scan::state_info::StateInfo;
 use crate::schema::{
-    ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, StructField, StructType,
-    ToSchema as _,
+    lazy_schema_ref, ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, StructField,
+    StructType, ToSchema as _,
 };
-use crate::table_features::{ColumnMappingMode, Operation};
+use crate::table_configuration::TableConfiguration;
+use crate::table_features::{get_any_level_column_physical_name, ColumnMappingMode, Operation};
 use crate::transforms::{transform_output_type, ExpressionTransform, SchemaTransform};
-use crate::utils::IteratorExt;
+use crate::utils::{FoldWithOption as _, IteratorExt};
 use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, SnapshotRef, Version};
 
 pub(crate) mod data_skipping;
 pub(crate) mod field_classifiers;
 pub mod log_replay;
 pub(crate) mod metrics;
+#[cfg(feature = "declarative-plans")]
+pub(crate) mod scan_plan;
 pub mod state;
 pub(crate) mod state_info;
 pub(crate) mod transform_spec;
@@ -56,21 +64,17 @@ pub(crate) mod test_utils;
 #[cfg(test)]
 mod tests;
 
-// safety: we define get_commit_schema() and _know_ it contains ADD_NAME and REMOVE_NAME
-#[allow(clippy::unwrap_used)]
-pub(crate) static COMMIT_READ_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    get_commit_schema()
-        .project(&[ADD_NAME, REMOVE_NAME])
-        .unwrap()
-});
-// safety: we define get_commit_schema() and _know_ it contains ADD_NAME and SIDECAR_NAME
-#[allow(clippy::unwrap_used)]
-pub(crate) static CHECKPOINT_READ_SCHEMA: LazyLock<SchemaRef> =
-    LazyLock::new(|| get_commit_schema().project(&[ADD_NAME]).unwrap());
+pub(crate) static COMMIT_READ_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+    (&ADD_FIELD),
+    (&REMOVE_FIELD),
+};
+pub(crate) static CHECKPOINT_READ_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+    (&ADD_FIELD),
+};
 
-/// Checkpoint schema WITHOUT stats for column projection pushdown.
-/// When skip_stats is enabled, we use this schema to avoid reading the stats column from parquet.
-pub(crate) static CHECKPOINT_READ_SCHEMA_NO_STATS: LazyLock<SchemaRef> = LazyLock::new(|| {
+/// Initial checkpoint projection without JSON `add.stats`.
+/// Discovery restores JSON stats when structured stats cannot satisfy the scan.
+pub(crate) static CHECKPOINT_READ_SCHEMA_NO_JSON_STATS: LazyLock<SchemaRef> = LazyLock::new(|| {
     let add_schema = Add::to_schema();
     let fields_no_stats: Vec<_> = add_schema
         .fields()
@@ -89,41 +93,156 @@ pub use crate::parallel::parallel_scan_metadata::{
     AfterSequentialScanMetadata, ParallelScanMetadata, ParallelState, SequentialScanMetadata,
 };
 
-/// Controls how file statistics are handled during a scan.
+/// Configures structured-stats output and JSON synthesis in scan metadata.
+/// Existing JSON passes through for commits and checkpoints without compatible structured stats
+/// unless stats are disabled.
 ///
-/// This enum determines whether and which statistics columns appear in scan metadata output,
-/// and whether internal data skipping is enabled.
-#[derive(Debug, Clone)]
-pub enum StatsOutputMode {
-    /// Output all table stats columns in `stats_parsed`.
-    AllColumns,
-    /// Output stats for specific columns. An empty list means no stats output, but
-    /// predicate-based data skipping still works internally.
-    Columns(Vec<ColumnName>),
-    /// Skip reading stats entirely. Disables data skipping.
-    Skip,
+/// Most consumers should pick one of the named constructors:
+/// - [`Self::json_only`] (default) -- JSON stats only.
+/// - [`Self::all_struct`] -- all struct stats without JSON synthesis. Compatible checkpoints omit
+///   JSON stats; commits and checkpoints without compatible structured stats pass existing JSON
+///   through.
+/// - [`Self::struct_columns`] -- selected struct stats with the same JSON behavior.
+/// - [`Self::all`] -- both representations.
+/// - [`Self::none`] -- neither, AND disables internal data skipping. Unlike the other four
+///   constructors, this is the only one that stops kernel from reading stats from parquet at all.
+#[derive(Clone, Debug)]
+pub struct StatsOptions {
+    /// Whether to surface JSON stats on parsed-stats checkpoints (where the
+    /// checkpoint writes stats only as a struct, not as JSON). When true, kernel
+    /// re-serializes the struct stats into JSON so engines that read JSON stats
+    /// see a populated value; when false, JSON stats are left null on such
+    /// checkpoints and the engine consumes the struct stats directly.
+    ///
+    /// No effect on tables that write JSON stats directly, or on commit JSON --
+    /// the existing JSON is passed through regardless.
+    pub(crate) synthesize_json: bool,
+
+    /// Which struct stats columns to request in `stats_parsed`.
+    pub(crate) struct_stats: StructStats,
 }
 
-impl Default for StatsOutputMode {
+/// Which struct stats columns appear in `stats_parsed` in scan metadata output.
+#[derive(Clone, Debug)]
+pub enum StructStats {
+    /// Don't emit `stats_parsed`. Kernel still reads predicate-referenced stats for
+    /// internal data skipping unless the caller picked [`StatsOptions::none`], which
+    /// disables stats reading entirely.
+    None,
+    /// Emit all indexed stats columns.
+    All,
+    /// Emit at least the specified stats columns. Predicate-referenced columns may also appear.
+    Columns(Vec<ColumnName>),
+}
+
+impl Default for StatsOptions {
+    /// JSON only, no struct stats.
     fn default() -> Self {
-        StatsOutputMode::Columns(Vec::new())
+        Self {
+            synthesize_json: true,
+            struct_stats: StructStats::None,
+        }
+    }
+}
+
+impl StatsOptions {
+    /// JSON only. Equivalent to [`Default::default`].
+    pub fn json_only() -> Self {
+        Self::default()
+    }
+
+    /// All struct stats without JSON synthesis. Compatible checkpoints omit JSON stats and avoid
+    /// per-batch `ToJson`; commits and checkpoints without compatible structured stats pass
+    /// existing JSON through.
+    pub fn all_struct() -> Self {
+        Self {
+            synthesize_json: false,
+            struct_stats: StructStats::All,
+        }
+    }
+
+    /// Struct stats for at least the specified columns without JSON synthesis. Predicate-referenced
+    /// columns may also appear because scan paths can retain stats used for data skipping.
+    pub fn struct_columns(cols: Vec<ColumnName>) -> Self {
+        Self {
+            synthesize_json: false,
+            struct_stats: StructStats::Columns(cols),
+        }
+    }
+
+    /// Both JSON and struct stats. Pays for both representations.
+    pub fn all() -> Self {
+        Self {
+            synthesize_json: true,
+            struct_stats: StructStats::All,
+        }
+    }
+
+    /// **Disables all stats work**: no stats output, no internal data skipping (even
+    /// when a predicate is set). Kernel reads no stats columns from parquet at all.
+    /// Use when the engine handles its own pruning.
+    ///
+    /// To get internal predicate-based skipping without `stats_parsed` output, use
+    /// [`StatsOptions::default`] (JSON only) or set `struct_stats` to `All`/`Columns(_)`.
+    pub fn none() -> Self {
+        Self {
+            synthesize_json: false,
+            struct_stats: StructStats::None,
+        }
+    }
+}
+
+/// Engine-facing partition value options. Pass to [`ScanBuilder::with_partition_values`] to
+/// declare whether scan metadata output includes the typed `partitionValues_parsed` struct
+/// alongside the raw string map (`fileConstantValues.partitionValues`), which is always present.
+///
+/// When the typed struct is requested, scan metadata output gains a top-level
+/// `partitionValues_parsed` struct column with one typed nullable field per partition column
+/// (physical names, table partition-column order). On non-partitioned tables the column is
+/// omitted. Values come directly from the checkpoint's native `partitionValues_parsed` column
+/// when present, otherwise from parsing the string map.
+#[derive(Clone, Debug, Default)]
+pub struct PartitionValuesOptions {
+    /// Whether to emit the typed `partitionValues_parsed` struct column.
+    pub(crate) parsed_struct: bool,
+}
+
+impl PartitionValuesOptions {
+    /// Raw string map only, no typed struct. Equivalent to [`Default::default`].
+    pub fn string_map_only() -> Self {
+        Self::default()
+    }
+
+    /// Emit the typed `partitionValues_parsed` struct alongside the raw string map. Lets engines
+    /// consume `partitionValues_parsed` directly instead of parsing the string map per row.
+    pub fn with_struct() -> Self {
+        Self {
+            parsed_struct: true,
+        }
     }
 }
 
 /// Builder to scan a snapshot of a table.
 pub struct ScanBuilder {
     snapshot: SnapshotRef,
-    schema: Option<SchemaRef>,
+    logical_read_schema: Option<SchemaRef>,
     predicate: Option<PredicateRef>,
-    stats_output_mode: StatsOutputMode,
+    stats: StatsOptions,
+    correlation_id: Option<Arc<str>>,
+    without_row_transforms: bool,
+    partition_values: PartitionValuesOptions,
+    cancellation_token: Option<CancellationTokenRef>,
 }
 
 impl std::fmt::Debug for ScanBuilder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
         f.debug_struct("ScanBuilder")
-            .field("schema", &self.schema)
+            .field("logical_read_schema", &self.logical_read_schema)
             .field("predicate", &self.predicate)
-            .field("stats_output_mode", &self.stats_output_mode)
+            .field("stats", &self.stats)
+            .field("correlation_id", &self.correlation_id)
+            .field("without_row_transforms", &self.without_row_transforms)
+            .field("partition_values", &self.partition_values)
             .finish()
     }
 }
@@ -133,9 +252,13 @@ impl ScanBuilder {
     pub fn new(snapshot: impl Into<SnapshotRef>) -> Self {
         Self {
             snapshot: snapshot.into(),
-            schema: None,
+            logical_read_schema: None,
             predicate: None,
-            stats_output_mode: StatsOutputMode::default(),
+            stats: StatsOptions::default(),
+            correlation_id: None,
+            without_row_transforms: false,
+            partition_values: PartitionValuesOptions::default(),
+            cancellation_token: None,
         }
     }
 
@@ -146,8 +269,8 @@ impl ScanBuilder {
     ///
     /// [`Schema`]: crate::schema::Schema
     /// [`Snapshot`]: crate::snapshot::Snapshot
-    pub fn with_schema(mut self, schema: SchemaRef) -> Self {
-        self.schema = Some(schema);
+    pub fn with_schema(mut self, logical_read_schema: SchemaRef) -> Self {
+        self.logical_read_schema = Some(logical_read_schema);
         self
     }
 
@@ -156,80 +279,98 @@ impl ScanBuilder {
     ///
     /// [`Snapshot`]: crate::Snapshot
     pub fn with_schema_opt(self, schema_opt: Option<SchemaRef>) -> Self {
-        match schema_opt {
-            Some(schema) => self.with_schema(schema),
-            None => self,
-        }
+        self.fold_with(schema_opt, ScanBuilder::with_schema)
     }
 
     /// Optionally provide an expression to filter rows. For example, using the predicate `x <
     /// 4` to return a subset of the rows in the scan which satisfy the filter. If `predicate_opt`
     /// is `None`, this is a no-op.
     ///
-    /// NOTE: The filtering is best-effort and can produce false positives (rows that should should
+    /// NOTE: The filtering is best-effort and can produce false positives (rows that should
     /// have been filtered out but were kept).
     ///
-    /// This method can be combined with [`include_all_stats_columns`]. When both are used, the
-    /// kernel performs data skipping internally using the predicate AND outputs parsed
-    /// statistics to the engine via the `stats_parsed` column in scan metadata.
+    /// NOTE: Predicates referencing metadata columns the caller added to the projection via
+    /// [`StructType::add_metadata_column`] (row indexes, row ids, file paths) are not supported
+    /// and will error at build time.
     ///
-    /// [`include_all_stats_columns`]: ScanBuilder::include_all_stats_columns
+    /// A predicate alone enables internal data skipping; kernel does not surface stats
+    /// to the engine by default. Use [`with_stats`](Self::with_stats) if the engine
+    /// also wants stats in the scan metadata output.
+    ///
+    /// [`StructType::add_metadata_column`]: crate::schema::StructType::add_metadata_column
     pub fn with_predicate(mut self, predicate: impl Into<Option<PredicateRef>>) -> Self {
         self.predicate = predicate.into();
         self
     }
 
-    /// Include all parsed statistics in scan metadata.
+    /// Configure stats output for the scan. See [`StatsOptions`].
     ///
-    /// When enabled, the scan will include a `stats_parsed` column in the scan metadata
-    /// containing pre-parsed file statistics (minValues, maxValues, nullCount, numRecords)
-    /// that integrations can use for their own data skipping logic.
-    ///
-    /// The statistics schema is determined by the table's configuration
-    /// (`delta.dataSkippingStatsColumns` or `delta.dataSkippingNumIndexedCols`). In the future,
-    /// a requested columns filter may limit which columns appear in the output without
-    /// affecting the table-level column counting.
-    ///
-    /// This method can be combined with [`with_predicate`]. When both are used, the kernel
-    /// performs data skipping internally using the predicate AND outputs parsed statistics to the
-    /// engine via the `stats_parsed` column in scan metadata.
-    ///
-    /// [`with_predicate`]: ScanBuilder::with_predicate
-    pub fn include_all_stats_columns(mut self) -> Self {
-        self.stats_output_mode = StatsOutputMode::AllColumns;
+    /// Defaults to [`StatsOptions::default`] (JSON only). Engines that consume
+    /// `stats_parsed` directly should pass [`StatsOptions::all_struct`] so compatible
+    /// checkpoints omit JSON stats and skip `ToJson` synthesis.
+    pub fn with_stats(mut self, stats: StatsOptions) -> Self {
+        self.stats = stats;
         self
     }
 
-    /// Include specific columns in the scan metadata.
+    /// Attach an opaque, caller-supplied correlation id for joining this scan's metric events to
+    /// the caller's own request or operation id. An empty id is treated as unset. When unset,
+    /// behavior is unchanged.
     ///
-    /// When `columns` is non-empty, only those columns' statistics appear in `stats_parsed`.
-    /// When `columns` is empty, no stats are output (equivalent to the default behavior).
+    /// Note: like `operation_id`, the correlation id does not currently survive the
+    /// [`Scan::parallel_scan_metadata`] serialization boundary. A [`ParallelState`] reconstructed
+    /// from serialized bytes on a remote worker carries no correlation id (tracked in #2736).
     ///
-    /// [`with_stats_columns`]: ScanBuilder::with_stats_columns
-    /// [`build`]: ScanBuilder::build
-    pub fn with_stats_columns(mut self, columns: Vec<ColumnName>) -> Self {
-        self.stats_output_mode = StatsOutputMode::Columns(columns);
+    /// [`ParallelState`]: crate::scan::ParallelState
+    pub fn with_correlation_id(mut self, correlation_id: impl Into<Arc<str>>) -> Self {
+        self.correlation_id = Some(correlation_id.into()).filter(|id| !id.is_empty());
         self
     }
 
-    /// Skip reading file statistics from checkpoint files.
+    /// Declare that the engine will reconstruct logical rows itself and will not consume
+    /// [`ScanMetadata::scan_file_transforms`].
     ///
-    /// When enabled:
-    /// - Parquet checkpoint reads use column projection to skip the stats column
-    /// - The `stats` field in scan results will be `None`
-    /// - Columnar data skipping is disabled (no stats-based or partition-value-based pruning), but
-    ///   row-level partition filtering still applies
+    /// The kernel then skips building the per-file transform expressions and the per-row
+    /// partition-value parse done only to build them. The returned `scan_file_transforms` is left
+    /// empty (each row's transform is `None`); use [`Scan::scan_metadata`] for listing.
     ///
-    /// If called after [`include_all_stats_columns`] or [`with_stats_columns`], the last call wins.
+    /// With this set the engine must itself apply every physical-to-logical fixup the transform
+    /// would normally perform: partition column injection, column-mapping renames, and generated
+    /// row ids. Deletion vectors are unaffected: they are delivered per file in the scan metadata
+    /// regardless. [`Scan::execute`] returns an error.
+    pub fn without_row_transforms(mut self) -> Self {
+        self.without_row_transforms = true;
+        self
+    }
+
+    /// Configure partition value output for the scan. See [`PartitionValuesOptions`].
     ///
-    /// Use this when data skipping is handled externally (e.g., by the query engine).
+    /// Defaults to [`PartitionValuesOptions::default`] (string map only). Engines that
+    /// consume `partitionValues_parsed` directly should pass
+    /// [`PartitionValuesOptions::with_struct`] to also emit the typed struct column.
+    pub fn with_partition_values(mut self, partition_values: PartitionValuesOptions) -> Self {
+        self.partition_values = partition_values;
+        self
+    }
+
+    /// Provide a [`CancellationToken`] so a cancelled request can stop an in-flight
+    /// [`scan_metadata`](Scan::scan_metadata) log replay instead of running to completion.
     ///
-    /// [`include_all_stats_columns`]: ScanBuilder::include_all_stats_columns
-    /// [`with_stats_columns`]: ScanBuilder::with_stats_columns
-    pub fn with_skip_stats(mut self, skip_stats: bool) -> Self {
-        if skip_stats {
-            self.stats_output_mode = StatsOutputMode::Skip;
-        }
+    /// Cancellation is cooperative: kernel polls the token at each action-batch boundary, and a
+    /// cancellation-aware [`Engine`] additionally races its checkpoint/commit reads against it.
+    /// On cancellation the scan surfaces [`Error::Cancelled`] -- either returned directly from
+    /// [`scan_metadata`](Scan::scan_metadata) when the token is already cancelled before replay
+    /// begins, or as the terminal item of its iterator -- never as a silent early `None`, so a
+    /// cancelled listing cannot be mistaken for a complete one. With no token the scan is not
+    /// cancellable.
+    ///
+    /// [`CancellationToken`]: crate::CancellationToken
+    /// [`Error::Cancelled`]: crate::Error::Cancelled
+    pub fn with_cancellation_token(
+        mut self,
+        token: impl Into<Option<CancellationTokenRef>>,
+    ) -> Self {
+        self.cancellation_token = token.into();
         self
     }
 
@@ -240,25 +381,57 @@ impl ScanBuilder {
     /// [`Scan`] type itself can be used to fetch the files and associated metadata required to
     /// perform actual data reads.
     pub fn build(self) -> DeltaResult<Scan> {
+        // Predicates may reference columns outside self.logical_read_schema, so resolve against the
+        // full table schema
+        let table_schema = self.snapshot.schema();
+        // Reject scans of empty-schema tables. CREATE TABLE accepts an empty schema as
+        // a transient state, but a scan over zero columns has no way to derive row
+        // counts downstream and panics in the arrow layer. Users must populate the
+        // schema with ALTER TABLE ADD COLUMN before scanning.
+        if table_schema.num_fields() == 0 {
+            return Err(Error::generic(
+                "Cannot scan Delta table with empty schema; use ALTER TABLE ADD COLUMN \
+                 to add at least one column before scanning",
+            ));
+        }
+
         // if no schema is provided, use snapshot's entire schema (e.g. SELECT *)
-        let logical_schema = self.schema.unwrap_or_else(|| self.snapshot.schema());
+        let logical_read_schema = self
+            .logical_read_schema
+            .unwrap_or_else(|| table_schema.clone());
 
         self.snapshot
             .table_configuration()
             .ensure_operation_supported(Operation::Scan)?;
 
-        let state_info = StateInfo::try_new(
-            logical_schema,
+        let mut state_info = StateInfo::try_new(
+            logical_read_schema,
+            table_schema,
             self.snapshot.table_configuration(),
             self.predicate,
-            self.stats_output_mode.clone(),
+            &self.stats,
+            &self.partition_values,
             (), // No classifier, default is for scans
+        )?;
+
+        // Retain the transform spec but skip building per-file expressions, which also skips the
+        // per-row partition-value parse done only to build them.
+        state_info.skip_row_transforms = self.without_row_transforms;
+
+        let physical_stats_output_schema = build_physical_stats_output_schema(
+            self.snapshot.table_configuration(),
+            &state_info,
+            &self.stats,
         )?;
 
         Ok(Scan {
             snapshot: self.snapshot,
             state_info: Arc::new(state_info),
-            stats_output_mode: self.stats_output_mode,
+            stats: self.stats,
+            physical_stats_output_schema,
+            correlation_id: self.correlation_id,
+            partition_values: self.partition_values,
+            cancellation_token: self.cancellation_token,
         })
     }
 }
@@ -403,9 +576,9 @@ impl<'a> SchemaTransform<'a> for GetReferencedFields<'a> {
     }
 }
 
-/// Prefixes all column references in a predicate with a fixed path.
-/// Transforms data-skipping predicates (e.g., `minValues.x > 100`) into
-/// checkpoint/sidecar-compatible predicates (e.g., `add.stats_parsed.minValues.x > 100`).
+/// Prefixes all column references in a predicate with a fixed path. The checkpoint path prefixes
+/// stat expressions that already carry their `stats_parsed.*` root (e.g. `stats_parsed.minValues.x
+/// > 100`) with `add`, yielding `add.stats_parsed.minValues.x > 100`.
 struct PrefixColumns {
     prefix: ColumnName,
 }
@@ -517,7 +690,55 @@ impl HasSelectionVector for ScanMetadata {
 pub struct Scan {
     snapshot: SnapshotRef,
     state_info: Arc<StateInfo>,
-    stats_output_mode: StatsOutputMode,
+    stats: StatsOptions,
+    #[allow(dead_code)] // Only used when `declarative-plans` is enabled
+    physical_stats_output_schema: Option<SchemaRef>,
+    correlation_id: Option<Arc<str>>,
+    partition_values: PartitionValuesOptions,
+    /// Optional cooperative cancellation token supplied via
+    /// [`ScanBuilder::with_cancellation_token`]. `None` means the scan is not cancellable.
+    cancellation_token: Option<CancellationTokenRef>,
+}
+
+/// Builds the physical `stats_parsed` output schema requested through `StatsOptions`.
+///
+/// For example, if the caller requests `[a, b]` and the predicate references `c`,
+/// `StateInfo::physical_stats_schema` contains `[a, b, c]`, while this returns `[a, b]`.
+/// Returns `None` when no eligible struct stats are requested and errors when a requested column
+/// cannot be resolved.
+fn build_physical_stats_output_schema(
+    table_configuration: &TableConfiguration,
+    state_info: &StateInfo,
+    stats: &StatsOptions,
+) -> DeltaResult<Option<SchemaRef>> {
+    match &stats.struct_stats {
+        StructStats::None => Ok(None),
+        StructStats::All => Ok(state_info.physical_stats_schema.clone()),
+        StructStats::Columns(columns) if columns.is_empty() => Ok(None),
+        StructStats::Columns(columns) => {
+            let logical_schema = table_configuration.logical_schema();
+            let column_mapping_mode = table_configuration.column_mapping_mode();
+            let physical_columns: Vec<_> = columns
+                .iter()
+                .map(|column| {
+                    get_any_level_column_physical_name(&logical_schema, column, column_mapping_mode)
+                })
+                .try_collect()?;
+            let stats_schema = table_configuration
+                .build_expected_stats_schemas(None, Some(&physical_columns))?
+                .physical;
+
+            Ok(stats_schema_with_data_columns(stats_schema))
+        }
+    }
+}
+
+/// Returns `schema` only when it contains stats for at least one data column.
+///
+/// Expected stats schemas always contain `numRecords` and `tightBounds`. `nullCount` is present
+/// only when at least one data column survives stats filtering.
+fn stats_schema_with_data_columns(schema: SchemaRef) -> Option<SchemaRef> {
+    schema.field(NULL_COUNT).is_some().then_some(schema)
 }
 
 impl std::fmt::Debug for Scan {
@@ -525,15 +746,59 @@ impl std::fmt::Debug for Scan {
         f.debug_struct("Scan")
             .field("schema", &self.state_info.logical_schema)
             .field("predicate", &self.state_info.physical_predicate)
-            .field("stats_output_mode", &self.stats_output_mode)
+            .field("stats", &self.stats)
+            .field("correlation_id", &self.correlation_id)
             .finish()
     }
 }
 
 impl Scan {
-    /// Whether stats reading is entirely skipped, disabling data skipping.
+    /// Whether stats reading is entirely skipped, disabling internal data skipping.
     fn skip_stats(&self) -> bool {
-        matches!(self.stats_output_mode, StatsOutputMode::Skip)
+        !self.stats.synthesize_json && matches!(self.stats.struct_stats, StructStats::None)
+    }
+
+    fn checkpoint_read_options(&self) -> (SchemaRef, Option<PredicateRef>, Option<&StructType>) {
+        let skip_stats = self.skip_stats();
+        // `physical_stats_schema` is the typed shape this scan can consume, not evidence that the
+        // checkpoint contains `stats_parsed`. Checkpoint discovery validates availability and
+        // restores `add.stats` before opening the reader when the structured field is incompatible.
+        let can_replace_json_with_structured_stats =
+            !self.stats.synthesize_json && self.state_info.physical_stats_schema.is_some();
+        let checkpoint_schema = if skip_stats || can_replace_json_with_structured_stats {
+            CHECKPOINT_READ_SCHEMA_NO_JSON_STATS.clone()
+        } else {
+            CHECKPOINT_READ_SCHEMA.clone()
+        };
+
+        let meta_predicate = if skip_stats {
+            None
+        } else {
+            self.build_actions_meta_predicate()
+        };
+        // Discovery uses this schema to augment the checkpoint projection, so `none()` must
+        // suppress it as well as the initial JSON stats field.
+        let physical_stats_schema = if skip_stats {
+            None
+        } else {
+            self.state_info.physical_stats_schema.as_deref()
+        };
+        (checkpoint_schema, meta_predicate, physical_stats_schema)
+    }
+
+    /// Build the read-options bundle passed to [`ScanLogReplayProcessor`].
+    fn stats_options(&self) -> log_replay::ScanStatsOptions {
+        log_replay::ScanStatsOptions {
+            skip_stats: self.skip_stats(),
+            synthesize_json: self.stats.synthesize_json,
+        }
+    }
+
+    /// Build the partition-value read options passed to [`ScanLogReplayProcessor`].
+    fn partition_values_options(&self) -> log_replay::ScanPartitionValuesOptions {
+        log_replay::ScanPartitionValuesOptions {
+            parsed_struct: self.partition_values.parsed_struct,
+        }
     }
 
     /// The table's root URL. Any relative paths returned from `scan_data` (or in a callback from
@@ -731,23 +996,18 @@ impl Scan {
 
         // For incremental reads, new_log_segment has no checkpoint but we use the
         // checkpoint schema returned by the function for consistency.
-        let (checkpoint_schema, meta_predicate) = if self.skip_stats() {
-            (CHECKPOINT_READ_SCHEMA_NO_STATS.clone(), None)
-        } else {
-            (
-                CHECKPOINT_READ_SCHEMA.clone(),
-                self.build_actions_meta_predicate(),
-            )
-        };
+        let (checkpoint_schema, meta_predicate, physical_stats_schema) =
+            self.checkpoint_read_options();
         let result = new_log_segment.read_actions_with_projected_checkpoint_actions(
             engine,
             COMMIT_READ_SCHEMA.clone(),
             checkpoint_schema,
             meta_predicate,
-            self.state_info
-                .physical_stats_schema
-                .as_ref()
-                .map(|s| s.as_ref()),
+            physical_stats_schema,
+            None,
+            // The incremental path relies on the batch-boundary poll in `scan_metadata_inner`
+            // for cancellation; it does not thread the token into the engine reads here, so a
+            // read already in flight is not interrupted mid-I/O.
             None,
         )?;
         let actions_with_checkpoint_info = ActionsWithCheckpointInfo {
@@ -772,6 +1032,8 @@ impl Scan {
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>>> {
         let start = Instant::now();
         let operation_id = MetricId::new();
+        let is_catalog_managed = self.snapshot.table_configuration().is_catalog_managed();
+        let correlation_id = self.correlation_id.clone();
 
         let (iter, metrics) = match self.state_info.physical_predicate {
             PhysicalPredicate::StaticSkipAll => {
@@ -779,23 +1041,58 @@ impl Scan {
                 (None, Arc::new(ScanMetrics::default()))
             }
             _ => {
+                // Wrap the input iterator (not the shared `process_actions_iter`) so token
+                // polling stays scoped to scans.
+                let actions = CancellableIterator::new(
+                    actions_with_checkpoint_info.actions,
+                    self.cancellation_token.clone(),
+                );
                 let (it, m) = scan_action_iter(
                     engine,
-                    actions_with_checkpoint_info.actions,
+                    actions,
                     self.state_info.clone(),
                     actions_with_checkpoint_info.checkpoint_info,
-                    self.skip_stats(),
+                    self.stats_options(),
+                    self.partition_values_options(),
                 )?;
                 (Some(it), m)
             }
         };
 
         let on_complete = move || {
-            let event = metrics.to_event(operation_id, ScanType::Full, start.elapsed());
+            let event = metrics.to_event(
+                operation_id,
+                is_catalog_managed,
+                correlation_id,
+                ScanType::Full,
+                start.elapsed(),
+            );
             info!(%event);
             emit_scan_metadata_completed(&event);
         };
         Ok(iter.into_iter().flatten().on_complete(on_complete))
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    /// Builds a declarative plan that produces the scan's live `add` actions.
+    ///
+    /// `engine` supplies the plan executor used to inspect checkpoint shape. Returns `None` when
+    /// no Delta metadata matches this scan.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the engine provides no [`PlanExecutor`](crate::plans::PlanExecutor),
+    /// or if log discovery, checkpoint inspection, or plan construction fails.
+    pub fn declarative_metadata_scan_plan(&self, engine: &dyn Engine) -> DeltaResult<Option<Plan>> {
+        // Resolve the checkpoint shape once: it selects the leaf-vs-manifest arm and reports
+        // whether the checkpoint carries a compatible parsed-stats column.
+        let plan_executor = engine.require_plan_executor()?;
+        let shape = CheckpointShape::try_new(
+            plan_executor.as_ref(),
+            &self.snapshot,
+            self.state_info.physical_stats_schema.as_ref(),
+        )?;
+        self.build_metadata_scan_plan(&shape)
     }
 
     // Factored out to facilitate testing
@@ -805,14 +1102,10 @@ impl Scan {
     ) -> DeltaResult<
         ActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
     > {
-        let (checkpoint_schema, meta_predicate) = if self.skip_stats() {
-            (CHECKPOINT_READ_SCHEMA_NO_STATS.clone(), None)
-        } else {
-            (
-                CHECKPOINT_READ_SCHEMA.clone(),
-                self.build_actions_meta_predicate(),
-            )
-        };
+        let (checkpoint_schema, meta_predicate, physical_stats_schema) =
+            self.checkpoint_read_options();
+        // Checkpoints already represent reconciled state, so scans project only Add actions. This
+        // derives `add.path IS NOT NULL` and allows readers to skip non-Add row groups.
         self.snapshot
             .log_segment()
             .read_actions_with_projected_checkpoint_actions(
@@ -820,48 +1113,65 @@ impl Scan {
                 COMMIT_READ_SCHEMA.clone(),
                 checkpoint_schema,
                 meta_predicate,
-                self.state_info
-                    .physical_stats_schema
-                    .as_ref()
-                    .map(|s| s.as_ref()),
+                physical_stats_schema,
                 self.state_info
                     .physical_partition_schema
                     .as_ref()
                     .map(|s| s.as_ref()),
+                self.cancellation_token.as_ref(),
             )
     }
 
     /// Builds a predicate for row group skipping in checkpoint and sidecar parquet files.
     ///
-    /// The scan predicate is first transformed into a data-skipping form with IS NULL guards
-    /// (e.g., `x > 100` becomes `OR(maxValues.x IS NULL, maxValues.x > 100)`), then column
-    /// references are prefixed with `add.stats_parsed` to match the physical column layout
-    /// of checkpoint/sidecar files. The parquet reader's row group filter can then use
-    /// parquet-level statistics on these nested columns to skip entire row groups that cannot
-    /// contain matching files.
+    /// The scan predicate is rewritten into a data-skipping form scoped under the `add` action:
+    /// data-column references become `add.stats_parsed.{minValues,maxValues,nullCount}.<col>` and
+    /// partition references become `add.partitionValues_parsed.<col>`, so the parquet reader's row
+    /// group filter can use footer statistics to skip row groups that cannot contain matching
+    /// files. See [`as_checkpoint_skipping_predicate`] for the rewrite and its data-stat IS NULL
+    /// guards.
     ///
-    /// The IS NULL guards are necessary because parquet footer min/max statistics ignore null
-    /// values. Without them, row groups containing files with missing stats (null stat columns)
-    /// could be incorrectly pruned, since the footer min/max wouldn't reflect those files.
-    ///
-    /// Returns `None` if the scan has no predicate, no stats schema, or if the predicate is a
-    /// bare unsupported expression (e.g. column-column comparison). Junctions with unsupported
-    /// arms replace them with TRUE to conservatively prevent pruning.
+    /// Returns `None` if the scan has no predicate, if neither a data-column stats schema nor a
+    /// partition schema is available, or if the predicate is a bare unsupported expression (e.g.
+    /// column-column comparison). Junctions represent unsupported arms with a NULL literal,
+    /// preserving three-valued logic while allowing independently decisive supported arms to
+    /// prune.
     fn build_actions_meta_predicate(&self) -> Option<PredicateRef> {
         let PhysicalPredicate::Some(ref predicate, _) = self.state_info.physical_predicate else {
             return None;
         };
-        self.state_info.physical_stats_schema.as_ref()?;
+        // Skipping needs either data-column stats or partition values to rewrite against; a
+        // partition-only predicate has no `stats_parsed` schema, a data-only predicate on an
+        // unpartitioned table has no partition schema.
+        if self.state_info.physical_stats_schema.is_none()
+            && self.state_info.physical_partition_schema.is_none()
+        {
+            return None;
+        }
 
-        let partition_columns = self
-            .snapshot
-            .table_configuration()
-            .metadata()
-            .partition_columns();
-        let skipping_pred = as_checkpoint_skipping_predicate(predicate, partition_columns)?;
+        // `partitionValues_parsed` is keyed by PHYSICAL partition name, and (under column mapping)
+        // the predicate also references physical columns, so partition detection reads the physical
+        // partition schema rather than the logical names in table metadata.
+        let mut partition_columns = HashSet::new();
+        let mut floating_partition_columns = HashSet::new();
+        if let Some(schema) = self.state_info.physical_partition_schema.as_ref() {
+            for field in schema.fields() {
+                let column = ColumnName::new([field.name()]);
+                if field.data_type() == &DataType::FLOAT || field.data_type() == &DataType::DOUBLE {
+                    floating_partition_columns.insert(column.clone());
+                }
+                partition_columns.insert(column);
+            }
+        }
+        let skipping_pred = as_checkpoint_skipping_predicate(
+            predicate,
+            &partition_columns,
+            &floating_partition_columns,
+            &self.state_info.physical_stats_columns,
+        )?;
 
         let mut prefixer = PrefixColumns {
-            prefix: ColumnName::new(["add", "stats_parsed"]),
+            prefix: column_name!("add"),
         };
         let prefixed = prefixer.transform_pred(&skipping_pred);
         Some(Arc::new(prefixed.into_owned()))
@@ -873,6 +1183,10 @@ impl Scan {
     /// checkpoint manifests sequentially. After exhausting this iterator, call `finish()`
     /// to determine if a distributed phase is needed.
     ///
+    /// Cancellation is not supported on this path: it errors if a token was set via
+    /// [`ScanBuilder::with_cancellation_token`], rather than silently running to completion.
+    /// Only [`scan_metadata`](Self::scan_metadata) honors the token today.
+    ///
     /// # Example
     ///
     /// ```no_run
@@ -881,7 +1195,7 @@ impl Scan {
     /// # use delta_kernel::scan::{AfterSequentialScanMetadata, ParallelScanMetadata};
     /// # use delta_kernel::Snapshot;
     /// # use url::Url;
-    /// # use delta_kernel::engine::default::DefaultEngineBuilder;
+    /// # use test_utils::delta_kernel_default_engine::DefaultEngineBuilder;
     /// # use delta_kernel::object_store::local::LocalFileSystem;
     /// # fn main() -> DeltaResult<()> {
     /// let engine = Arc::new(DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new())).build());
@@ -927,11 +1241,19 @@ impl Scan {
         &self,
         engine: Arc<dyn Engine>,
     ) -> DeltaResult<SequentialScanMetadata> {
+        // Fail fast rather than silently ignore a caller-supplied token: the parallel path does
+        // not thread cancellation, so honoring a set token would require dropping it on the floor.
+        if self.cancellation_token.is_some() {
+            return Err(Error::unsupported(
+                "cancellation is not supported by parallel_scan_metadata; \
+                 use scan_metadata for a cancellable scan",
+            ));
+        }
         // For the sequential/parallel phase approach, we use a conservative checkpoint_info
         // since SequentialPhase reads checkpoints via CheckpointManifestReader which doesn't
         // currently support stats_parsed optimization.
         let checkpoint_read_schema = if self.skip_stats() {
-            CHECKPOINT_READ_SCHEMA_NO_STATS.clone()
+            CHECKPOINT_READ_SCHEMA_NO_JSON_STATS.clone()
         } else {
             CHECKPOINT_READ_SCHEMA.clone()
         };
@@ -944,24 +1266,39 @@ impl Scan {
             engine.as_ref(),
             self.state_info.clone(),
             checkpoint_info,
-            self.skip_stats(),
+            self.stats_options(),
+            self.partition_values_options(),
         )?;
         let sequential =
             SequentialPhase::try_new(processor, self.snapshot.log_segment(), engine.clone())?;
 
-        Ok(SequentialScanMetadata::new(sequential))
+        Ok(SequentialScanMetadata::new(
+            sequential,
+            self.correlation_id.clone(),
+        ))
     }
 
     /// Perform an "all in one" scan. This will use the provided `engine` to read and process all
     /// the data for the query. Each [`EngineData`] in the resultant iterator is a portion of the
     /// final table data. Generally connectors/engines will want to use [`Scan::scan_metadata`] so
     /// they can have more control over the execution of the scan.
+    ///
+    /// Returns an error if the scan was built with [`ScanBuilder::without_row_transforms`]; use
+    /// [`Scan::scan_metadata`] instead.
     // This calls [`Scan::scan_metadata`] to get an iterator of `ScanMetadata` actions for the scan,
     // and then uses the `engine`'s [`crate::ParquetHandler`] to read the actual table data.
     pub fn execute(
         &self,
         engine: Arc<dyn Engine>,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>>> {
+        if self.state_info.skip_row_transforms {
+            return Err(Error::unsupported(
+                "Scan::execute is not supported when the scan was built with \
+                 without_row_transforms; use scan_metadata for listing and read data with your \
+                 own reader",
+            ));
+        }
+
         fn scan_metadata_callback(batches: &mut Vec<state::ScanFile>, file: state::ScanFile) {
             batches.push(file);
         }
@@ -1047,10 +1384,9 @@ impl Scan {
                     // to `rest` in a moment anyway
                     let mut sv = selection_vector.take();
                     let rest = split_vector(sv.as_mut(), len, None);
-                    let result = match sv {
-                        Some(sv) => logical.and_then(|data| data.apply_selection_vector(sv)),
-                        None => logical,
-                    };
+                    let result = logical.fold_with(sv, |logical, sv| {
+                        logical.and_then(|data| data.apply_selection_vector(sv))
+                    });
                     selection_vector = rest;
                     result
                 }))
@@ -1063,7 +1399,10 @@ impl Scan {
     }
 }
 
-/// Get the schema that scan rows (from [`Scan::scan_metadata`]) will be returned with.
+/// Get the base schema that scan rows (from [`Scan::scan_metadata`]) will be returned with.
+///
+/// This is the base shape; engines may add trailing `*_parsed` columns by opting in via
+/// [`StatsOptions`] (`stats_parsed`) or [`PartitionValuesOptions`] (`partitionValues_parsed`).
 ///
 /// It is:
 /// ```ignored
