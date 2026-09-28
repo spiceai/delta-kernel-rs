@@ -1,4 +1,3 @@
-pub mod models;
-pub mod predicate_parser;
+pub mod registry;
 pub mod runners;
 pub mod utils;

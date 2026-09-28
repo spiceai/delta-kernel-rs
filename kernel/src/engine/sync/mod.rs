@@ -1,17 +1,16 @@
-//! A simple, single threaded, test-only [`Engine`].
+//! A simple, single threaded, test-only `Engine`.
 //!
-//! All I/O goes through an [`ObjectStore`]. [`SyncEngine::new`] uses a [`LocalFileSystem`]
+//! All I/O goes through an `ObjectStore`. `SyncEngine::new` uses a [`LocalFileSystem`]
 //! built lazily per-URL (rooted at the URL's drive on Windows, or `/` on Unix), so any
-//! `file://` URL is supported. [`SyncEngine::new_with_store`] takes any other store
+//! `file://` URL is supported. `SyncEngine::new_with_store` takes any other store
 //! (e.g. `InMemory`) and uses it directly for all URLs.
 //!
 //! Async work is driven via [`futures::executor::block_on`], which is sufficient for stores
 //! that do not require a tokio reactor (`LocalFileSystem`, `InMemory`). Cloud-backed stores
 //! are NOT supported here -- they would deadlock because `block_on` parks the calling thread
 //! with no reactor to wake it. That's acceptable for this test-only engine; production code
-//! should use [`DefaultEngine`] instead.
+//! should use `DefaultEngine` from the `delta_kernel_default_engine` crate instead.
 //!
-//! [`DefaultEngine`]: crate::engine::default::DefaultEngine
 //! [`LocalFileSystem`]: crate::object_store::local::LocalFileSystem
 
 use std::sync::Arc;
@@ -25,20 +24,24 @@ use super::arrow_expression::ArrowEvaluationHandler;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::object_store::local::LocalFileSystem;
 use crate::object_store::path::Path;
-use crate::object_store::DynObjectStore;
-// `ObjectStoreExt` is needed for `store.get()` etc. in arrow-58 mode where these methods moved
-// off the `ObjectStore` trait. In arrow-57 mode the compat shim makes the import a no-op, so
-// silence the resulting unused-import warning.
-#[allow(unused_imports)]
-use crate::object_store::ObjectStoreExt as _;
+use crate::object_store::{DynObjectStore, ObjectStoreExt as _};
 use crate::{
-    DeltaResult, Engine, Error, EvaluationHandler, FileDataReadResultIterator, FileMeta,
-    JsonHandler, ParquetHandler, PredicateRef, SchemaRef, StorageHandler,
+    DeltaResult, Engine, Error, EvaluationHandler, FileMeta, JsonHandler, ParquetHandler,
+    PredicateRef, SchemaRef, StorageHandler,
 };
 
 pub(crate) mod json;
 mod parquet;
 mod storage;
+
+#[cfg(feature = "declarative-plans")]
+mod aggs;
+
+#[cfg(feature = "declarative-plans")]
+pub(crate) mod plan;
+
+#[cfg(feature = "declarative-plans")]
+use plan::SyncPlanExecutor;
 
 /// A simple (test-only) implementation of [`Engine`]. See module docs for supported stores.
 pub(crate) struct SyncEngine {
@@ -46,6 +49,8 @@ pub(crate) struct SyncEngine {
     json_handler: Arc<json::SyncJsonHandler>,
     parquet_handler: Arc<parquet::SyncParquetHandler>,
     evaluation_handler: Arc<ArrowEvaluationHandler>,
+    #[cfg(feature = "declarative-plans")]
+    plan_executor: Arc<SyncPlanExecutor>,
 }
 
 impl SyncEngine {
@@ -64,6 +69,8 @@ impl SyncEngine {
     fn new_inner(store: Option<Arc<DynObjectStore>>) -> Self {
         SyncEngine {
             storage_handler: Arc::new(storage::SyncStorageHandler::new(store.clone())),
+            #[cfg(feature = "declarative-plans")]
+            plan_executor: Arc::new(plan::SyncPlanExecutor::new(store.clone())),
             json_handler: Arc::new(json::SyncJsonHandler::new(store.clone())),
             parquet_handler: Arc::new(parquet::SyncParquetHandler::new(store)),
             evaluation_handler: Arc::new(ArrowEvaluationHandler {}),
@@ -86,6 +93,11 @@ impl Engine for SyncEngine {
 
     fn json_handler(&self) -> Arc<dyn JsonHandler> {
         self.json_handler.clone()
+    }
+
+    #[cfg(feature = "declarative-plans")]
+    fn plan_executor(&self) -> Option<Arc<dyn crate::plans::PlanExecutor>> {
+        Some(self.plan_executor.clone())
     }
 }
 
@@ -205,24 +217,21 @@ pub(super) fn put_bytes(
 }
 
 /// Read each file as bytes and feed it to `try_create_from_bytes` to produce data batches.
-fn read_files<F, I>(
+fn read_files_arrow<F, I>(
     store: Option<&Arc<DynObjectStore>>,
     files: &[FileMeta],
     schema: SchemaRef,
     predicate: Option<PredicateRef>,
     mut try_create_from_bytes: F,
-) -> DeltaResult<FileDataReadResultIterator>
+) -> impl Iterator<Item = DeltaResult<ArrowEngineData>> + Send + 'static
 where
     I: Iterator<Item = DeltaResult<ArrowEngineData>> + Send + 'static,
     F: FnMut(Bytes, SchemaRef, Option<PredicateRef>, String) -> DeltaResult<I> + Send + 'static,
 {
     debug!("Reading files: {files:#?} with schema {schema:#?} and predicate {predicate:#?}");
-    if files.is_empty() {
-        return Ok(Box::new(std::iter::empty()));
-    }
-    let files = files.to_vec();
+    let files = files.to_vec(); // Clone for static iterator (clippy hates chained to_vec+into_iter)
     let store = store.cloned();
-    let result = files
+    files
         .into_iter()
         .map(move |file| {
             let location_string = file.location.to_string();
@@ -230,28 +239,30 @@ where
             try_create_from_bytes(bytes, schema.clone(), predicate.clone(), location_string)
         })
         .flatten_ok()
-        .map(|data| Ok(Box::new(ArrowEngineData::new(data??.into())) as _));
-    Ok(Box::new(result))
+        .map(|data| data?)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::engine::tests::test_arrow_engine;
-
-    #[test]
-    fn test_sync_engine() {
-        let tmp = tempfile::tempdir().unwrap();
-        let url = Url::from_directory_path(tmp.path()).unwrap();
-        let engine = SyncEngine::new();
-        test_arrow_engine(&engine, &url);
-    }
-
-    #[test]
-    fn test_sync_engine_with_store() {
-        let store = Arc::new(crate::object_store::memory::InMemory::new());
-        let engine = SyncEngine::new_with_store(store);
-        let url = Url::parse("memory:///test/").unwrap();
-        test_arrow_engine(&engine, &url);
-    }
-}
+// TODO(#2618): Restore once the engine contract helpers move to test_utils and SyncEngine can
+// call them without the kernel-cfg-test cycle issue.
+//
+// #[cfg(test)]
+// mod tests {
+//     use super::*;
+//     use crate::engine::tests::test_arrow_engine;
+//
+//     #[test]
+//     fn test_sync_engine() {
+//         let tmp = tempfile::tempdir().unwrap();
+//         let url = Url::from_directory_path(tmp.path()).unwrap();
+//         let engine = SyncEngine::new();
+//         test_arrow_engine(&engine, &url);
+//     }
+//
+//     #[test]
+//     fn test_sync_engine_with_store() {
+//         let store = Arc::new(crate::object_store::memory::InMemory::new());
+//         let engine = SyncEngine::new_with_store(store);
+//         let url = Url::parse("memory:///test/").unwrap();
+//         test_arrow_engine(&engine, &url);
+//     }
+// }

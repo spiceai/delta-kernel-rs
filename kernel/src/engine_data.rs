@@ -70,11 +70,10 @@ impl FilteredEngineData {
         }
     }
 
-    /// Apply the contained selection vector and return an engine data with only the valid rows
-    /// included. This consumes the `FilteredEngineData`
+    /// Apply the contained selection vector and return an engine data with only the selected rows
+    /// included. This consumes the `FilteredEngineData`.
     pub fn apply_selection_vector(self) -> DeltaResult<Box<dyn EngineData>> {
-        self.data
-            .apply_selection_vector(self.selection_vector.clone())
+        self.data.apply_selection_vector(self.selection_vector)
     }
 }
 
@@ -194,6 +193,13 @@ impl<'a> MapItem<'a> {
             .rev()
             .find(|&idx| self.keys.value(idx) == key)?;
         self.values.is_valid(idx).then(|| self.values.value(idx))
+    }
+
+    /// Returns the map's keys in storage order, including keys whose value is null. Unlike
+    /// [`MapItem::materialize`], which drops null-valued entries, this exposes the full key set.
+    pub(crate) fn keys(&self) -> impl Iterator<Item = &'a str> + 'a {
+        let keys = self.keys;
+        self.offsets.clone().map(move |idx| keys.value(idx))
     }
 
     pub fn materialize(&self) -> HashMap<String, String> {
@@ -503,7 +509,7 @@ pub trait RowVisitor {
 ///     todo!() // convert `SchemaRef` and `ArrayData` into local representation and append them
 ///   }
 ///   fn apply_selection_vector(self: Box<Self>, selection_vector: Vec<bool>) -> DeltaResult<Box<dyn EngineData>> {
-///     todo!() // filter out unselected rows and return the new set of data
+///     todo!() // filter out unselected rows; rows beyond the selection vector's end are selected
 ///   }
 ///   fn has_field(&self, name: &ColumnName) -> bool {
 ///     todo!() // determine whether the field exists in the data
@@ -555,9 +561,14 @@ pub trait EngineData: AsAny {
         columns: Vec<ArrayData>,
     ) -> DeltaResult<Box<dyn EngineData>>;
 
-    /// Apply a selection vector to the data and return a data where only the valid rows are
+    /// Apply a selection vector to the data and return a data where only the selected rows are
     /// included. This consumes the EngineData, allowing engines to implement this "in place" if
-    /// desired
+    /// desired.
+    ///
+    /// The selection vector may be shorter than the data; rows beyond its end are selected and
+    /// must be retained (see [`FilteredEngineData`]). An empty selection vector selects all rows.
+    /// A selection vector longer than the data is invalid and must be rejected, e.g. with
+    /// [`Error::InvalidSelectionVector`].
     fn apply_selection_vector(
         self: Box<Self>,
         selection_vector: Vec<bool>,
@@ -565,7 +576,7 @@ pub trait EngineData: AsAny {
 
     /// Returns `true` if a field at the given (possibly nested) path exists in this data's schema.
     ///
-    /// For a top-level field named `"foo"`, use `ColumnName::new(["foo"])`. For nested fields,
+    /// For a top-level field named `"foo"`, use `column_name!("foo")`. For nested fields,
     /// each non-leaf element of the path must be a struct field at that level.
     fn has_field(&self, name: &ColumnName) -> bool;
 }
@@ -832,5 +843,33 @@ mod tests {
         #[case] expected: Vec<usize>,
     ) {
         assert_eq!(collect_indices(row_count, selection), expected);
+    }
+
+    #[test]
+    fn map_item_keys_includes_null_valued_keys() {
+        // Map { "a" => "1", "b" => null }: `keys()` must expose both keys, while `materialize()`
+        // (and `get`) drop the null-valued entry.
+        let keys = StringArray::from(vec!["a", "b"]);
+        let values = StringArray::from(vec![Some("1"), None]);
+        let map = MapItem::new(&keys, &values, 0..2);
+
+        let mut seen: Vec<&str> = map.keys().collect();
+        seen.sort_unstable();
+        assert_eq!(seen, vec!["a", "b"]);
+
+        assert_eq!(map.get("a"), Some("1"));
+        assert_eq!(map.get("b"), None);
+        assert_eq!(
+            map.materialize(),
+            HashMap::from([("a".to_string(), "1".to_string())])
+        );
+    }
+
+    #[test]
+    fn map_item_keys_empty() {
+        let keys = StringArray::from(Vec::<&str>::new());
+        let values = StringArray::from(Vec::<&str>::new());
+        let map = MapItem::new(&keys, &values, 0..0);
+        assert_eq!(map.keys().count(), 0);
     }
 }

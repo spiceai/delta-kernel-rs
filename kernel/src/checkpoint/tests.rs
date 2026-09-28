@@ -25,10 +25,10 @@ use crate::log_replay::HasSelectionVector;
 use crate::object_store::memory::InMemory;
 use crate::object_store::path::Path;
 use crate::object_store::ObjectStoreExt as _;
-use crate::schema::{DataType as KernelDataType, StructField, StructType};
+use crate::schema::{schema_ref, DataType as KernelDataType, StructField, StructType};
 use crate::table_features::TableFeature;
 use crate::transaction::create_table::create_table;
-use crate::utils::test_utils::Action;
+use crate::unit_test_utils::Action;
 use crate::{DeltaResult, FileMeta, LogPath, Snapshot};
 
 #[rstest::rstest]
@@ -70,7 +70,7 @@ async fn test_create_checkpoint_metadata_batch() -> DeltaResult<()> {
 
     let table_root = Url::parse("memory:///")?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
-    let writer = snapshot.create_checkpoint_writer()?;
+    let writer = snapshot.create_checkpoint_writer(&engine)?;
 
     // Use V2 schema for the checkpoint metadata batch
     let checkpoint_batch =
@@ -210,10 +210,7 @@ fn create_metadata_action_with_config(configuration: HashMap<String, String>) ->
         Metadata::try_new(
             Some("test-table".into()),
             None,
-            Arc::new(StructType::new_unchecked([StructField::nullable(
-                "value",
-                KernelDataType::INTEGER,
-            )])),
+            schema_ref! { nullable "value": INTEGER },
             vec![],
             0,
             configuration,
@@ -331,7 +328,7 @@ async fn test_v1_checkpoint_latest_version_by_default() -> DeltaResult<()> {
 
     let table_root = Url::parse("memory:///")?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
-    let writer = snapshot.create_checkpoint_writer()?;
+    let writer = snapshot.create_checkpoint_writer(&engine)?;
 
     // Verify the checkpoint file path is the latest version by default.
     assert_eq!(
@@ -404,7 +401,7 @@ async fn test_v1_checkpoint_specific_version() -> DeltaResult<()> {
     let snapshot = Snapshot::builder_for(table_root)
         .at_version(0)
         .build(&engine)?;
-    let writer = snapshot.create_checkpoint_writer()?;
+    let writer = snapshot.create_checkpoint_writer(&engine)?;
 
     // Verify the checkpoint file path is the specified version.
     assert_eq!(
@@ -456,7 +453,7 @@ async fn test_finalize_errors_if_checkpoint_data_iterator_is_not_exhausted() -> 
     let snapshot = Snapshot::builder_for(table_root)
         .at_version(0)
         .build(&engine)?;
-    let writer = snapshot.create_checkpoint_writer()?;
+    let writer = snapshot.create_checkpoint_writer(&engine)?;
     let data_iter = writer.checkpoint_data(&engine)?;
 
     /* The returned data iterator has batches that we do not consume */
@@ -559,7 +556,7 @@ async fn test_v2_checkpoint_supported_table() -> DeltaResult<()> {
 
     let table_root = Url::parse("memory:///")?;
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
-    let writer = snapshot.create_checkpoint_writer()?;
+    let writer = snapshot.create_checkpoint_writer(&engine)?;
 
     // Verify the checkpoint file path is the latest version by default.
     assert_eq!(
@@ -648,7 +645,7 @@ async fn test_no_checkpoint_on_unpublished_snapshot() -> DeltaResult<()> {
         .build(&engine)?;
 
     assert!(matches!(
-        snapshot.create_checkpoint_writer().unwrap_err(),
+        snapshot.create_checkpoint_writer(&engine).unwrap_err(),
         crate::Error::Generic(e) if e == "Log segment is not published"
     ));
     Ok(())
@@ -838,6 +835,88 @@ async fn test_checkpoint_preserves_domain_metadata() -> DeltaResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_checkpoint_excludes_tombstoned_domain_metadata() -> DeltaResult<()> {
+    // ===== Setup =====
+    let tmp_dir = tempdir().unwrap();
+    let table_path = tmp_dir.path();
+    let table_url = Url::from_directory_path(table_path).unwrap();
+    std::fs::create_dir_all(table_path.join("_delta_log")).unwrap();
+
+    // ===== Create Table with domainMetadata feature =====
+    let commit0 = [
+        json!({
+            "protocol": {
+                "minReaderVersion": 3,
+                "minWriterVersion": 7,
+                "readerFeatures": [],
+                "writerFeatures": ["domainMetadata"]
+            }
+        }),
+        json!({
+            "metaData": {
+                "id": "test-table-id",
+                "format": { "provider": "parquet", "options": {} },
+                "schemaString": "{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}",
+                "partitionColumns": [],
+                "configuration": {},
+                "createdTime": 1587968585495i64
+            }
+        }),
+    ]
+    .map(|j| j.to_string())
+    .join("\n");
+    std::fs::write(
+        table_path.join("_delta_log/00000000000000000000.json"),
+        commit0,
+    )
+    .unwrap();
+
+    // ===== Create Engine =====
+    // Use SyncEngine::new() (not new_with_store(LocalFileSystem::new())) so the engine builds
+    // per-URL LocalFileSystem instances rooted at the URL's drive. The bare
+    // LocalFileSystem::new() rejects absolute Windows paths via file:// URLs.
+    let engine = SyncEngine::new();
+
+    // ===== Commit domain metadata for "foo" =====
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+    let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+    let result = txn
+        .with_domain_metadata("foo".to_string(), "bar".to_string())
+        .commit(&engine)?;
+    assert!(result.is_committed());
+
+    // Verify domain exists before removal
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+    assert_eq!(
+        snapshot.get_domain_metadata("foo", &engine)?,
+        Some("bar".to_string())
+    );
+
+    // ===== Remove domain metadata for "foo" (tombstone) =====
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+    let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()), &engine)?;
+    let result = txn
+        .with_domain_metadata_removed("foo".to_string())
+        .commit(&engine)?;
+    assert!(result.is_committed());
+
+    // Verify domain is gone before checkpoint
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+    assert_eq!(snapshot.get_domain_metadata("foo", &engine)?, None);
+
+    // ===== Write checkpoint =====
+    snapshot.checkpoint(&engine, None)?;
+
+    // ===== Verify tombstoned domain is NOT present after loading from checkpoint =====
+    let snapshot = Snapshot::builder_for(table_url)
+        .at_version(snapshot.version())
+        .build(&engine)?;
+    assert_eq!(snapshot.get_domain_metadata("foo", &engine)?, None);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_checkpoint_skips_last_checkpoint_write_when_hint_version_is_newer() -> DeltaResult<()>
 {
     let (store, _) = new_in_memory_store();
@@ -846,10 +925,7 @@ async fn test_checkpoint_skips_last_checkpoint_write_when_hint_version_is_newer(
     let table_root = Url::parse("memory:///")?;
     let _ = create_table(
         table_root.as_str(),
-        Arc::new(StructType::new_unchecked([StructField::nullable(
-            "value",
-            KernelDataType::INTEGER,
-        )])),
+        schema_ref! { nullable "value": INTEGER },
         "test",
     )
     .build(&engine, Box::new(FileSystemCommitter::new()))?
@@ -895,8 +971,6 @@ async fn test_checkpoint_skips_last_checkpoint_write_when_hint_version_is_newer(
     snapshot_v1.checkpoint(&engine, None)?;
     assert_last_checkpoint_contents(&store, 2, 4, 2, size_in_bytes).await
 }
-
-// TODO: Add test that checkpoint does not contain tombstoned domain metadata.
 
 /// Helper to create metadata action with specific stats settings
 fn create_metadata_with_stats_config(
@@ -1046,7 +1120,7 @@ async fn test_stats_config_round_trip(
     // The add action for file1.parquet comes from checkpoint 1, so the COALESCE
     // expressions must recover stats across format changes.
     let snapshot2 = Snapshot::builder_for(table_root).build(&engine)?;
-    let writer2 = snapshot2.create_checkpoint_writer()?;
+    let writer2 = snapshot2.create_checkpoint_writer(&engine)?;
     let mut result2 = writer2.checkpoint_data(&engine)?;
 
     // Verify checkpoint 2 schema matches new settings
@@ -1124,7 +1198,7 @@ async fn test_stats_config_round_trip_partitioned(
 
     // Build snapshot that reads from checkpoint 1 + commit 2
     let snapshot2 = Snapshot::builder_for(table_root).build(&engine)?;
-    let writer2 = snapshot2.create_checkpoint_writer()?;
+    let writer2 = snapshot2.create_checkpoint_writer(&engine)?;
     let result2 = writer2.checkpoint_data(&engine)?;
 
     // Collect all checkpoint batches

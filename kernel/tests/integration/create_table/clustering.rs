@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use delta_kernel::committer::FileSystemCommitter;
-use delta_kernel::expressions::ColumnName;
+use delta_kernel::expressions::{column_name, ColumnName};
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::TableFeature;
@@ -24,26 +24,14 @@ fn clustering_test_schema() -> DeltaResult<Arc<StructType>> {
         StructField::new("zip", DataType::STRING, true),
     ])?;
     let l4 = StructType::try_new(vec![StructField::new("value", DataType::DOUBLE, true)])?;
-    let l3 = StructType::try_new(vec![StructField::new(
-        "l4",
-        DataType::Struct(Box::new(l4)),
-        true,
-    )])?;
-    let l2 = StructType::try_new(vec![StructField::new(
-        "l3",
-        DataType::Struct(Box::new(l3)),
-        true,
-    )])?;
-    let l1 = StructType::try_new(vec![StructField::new(
-        "l2",
-        DataType::Struct(Box::new(l2)),
-        true,
-    )])?;
+    let l3 = StructType::try_new(vec![StructField::new("l4", l4, true)])?;
+    let l2 = StructType::try_new(vec![StructField::new("l3", l3, true)])?;
+    let l1 = StructType::try_new(vec![StructField::new("l2", l2, true)])?;
     Ok(Arc::new(StructType::try_new(vec![
         StructField::new("id", DataType::INTEGER, true),
         StructField::new("name", DataType::STRING, true),
-        StructField::new("address", DataType::Struct(Box::new(address)), true),
-        StructField::new("l1", DataType::Struct(Box::new(l1)), true),
+        StructField::new("address", address, true),
+        StructField::new("l1", l1, true),
     ])?))
 }
 
@@ -142,7 +130,7 @@ async fn test_clustering_with_explicit_feature_signal_no_duplicates() -> DeltaRe
 
     // Verify clustering columns via snapshot read path
     let clustering_columns = snapshot.get_physical_clustering_columns(engine.as_ref())?;
-    assert_eq!(clustering_columns, Some(vec![ColumnName::new(["id"])]));
+    assert_eq!(clustering_columns, Some(vec![column_name!("id")]));
 
     Ok(())
 }

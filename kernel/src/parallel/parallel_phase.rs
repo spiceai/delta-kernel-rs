@@ -130,7 +130,6 @@ mod tests {
     use url::Url;
 
     use super::*;
-    use crate::actions::get_log_add_schema;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::SyncEngine;
     use crate::log_replay::FileActionKey;
@@ -143,13 +142,17 @@ mod tests {
         AfterSequentialScanMetadata, ParallelScanMetadata, ParallelState,
     };
     use crate::parquet::arrow::arrow_writer::ArrowWriter;
-    use crate::scan::log_replay::ScanLogReplayProcessor;
+    use crate::scan::log_replay::{
+        ScanLogReplayProcessor, ScanPartitionValuesOptions, ScanStatsOptions,
+    };
     use crate::scan::state::ScanFile;
     use crate::scan::state_info::tests::get_simple_state_info;
+    use crate::scan::{ScanBuilder, StatsOptions};
     use crate::schema::{DataType, StructField, StructType};
-    use crate::utils::test_utils::{
+    use crate::unit_test_utils::{
         install_thread_local_metrics_reporter, load_test_table, parse_json_batch, CapturingReporter,
     };
+    use crate::utils::FoldWithOption as _;
     use crate::{PredicateRef, SnapshotRef};
 
     // ============================================================
@@ -208,7 +211,8 @@ mod tests {
             state_info,
             checkpoint_info,
             seen_file_keys,
-            false,
+            ScanStatsOptions::default(),
+            ScanPartitionValuesOptions::default(),
         )
     }
 
@@ -382,11 +386,11 @@ mod tests {
         snapshot: &SnapshotRef,
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<Vec<String>> {
-        let mut builder = snapshot.clone().scan_builder();
-        if let Some(pred) = predicate {
-            builder = builder.with_predicate(pred);
-        }
-        let scan = builder.build()?;
+        let scan = snapshot
+            .clone()
+            .scan_builder()
+            .fold_with(predicate, ScanBuilder::with_predicate)
+            .build()?;
         let mut scan_metadata_iter = scan.scan_metadata(engine)?;
 
         let mut paths = scan_metadata_iter.try_fold(Vec::new(), |acc, metadata_res| {
@@ -409,11 +413,11 @@ mod tests {
 
         let expected_paths = get_expected_paths(engine.as_ref(), &snapshot, predicate.clone())?;
 
-        let mut builder = snapshot.scan_builder();
-        if let Some(pred) = predicate {
-            builder = builder.with_predicate(pred);
-        }
-        let scan = builder.build()?;
+        let scan = snapshot
+            .clone()
+            .scan_builder()
+            .fold_with(predicate, ScanBuilder::with_predicate)
+            .build()?;
         let mut sequential = scan.parallel_scan_metadata(engine.clone())?;
 
         let mut all_paths = sequential.try_fold(Vec::new(), |acc, metadata_res| {
@@ -490,6 +494,73 @@ mod tests {
             "Parallel workflow paths don't match scan_metadata paths for table '{table_name}'"
         );
 
+        Ok(())
+    }
+
+    /// A caller-supplied correlation id reaches both the sequential and parallel phase
+    /// `ScanMetadataCompleted` events. The sequential event is emitted before any serialization so
+    /// it always carries the id. The parallel event carries it in-memory but loses it when
+    /// `ParallelState` is rebuilt from bytes, a documented limitation shared with `operation_id`
+    /// (tracked in #2736). Workers are driven inline (not on spawned threads) so every emission
+    /// stays on the thread holding the metrics reporter guard.
+    #[rstest::rstest]
+    #[case::in_memory(false, Some("scan-corr-xyz"))]
+    #[case::across_serde_boundary(true, None)]
+    fn parallel_scan_metadata_phases_carry_correlation_id(
+        #[case] with_serde: bool,
+        #[case] expected_parallel: Option<&str>,
+    ) -> DeltaResult<()> {
+        // This table has checkpoint sidecars, so the sequential phase yields a parallel phase.
+        let (engine, snapshot, _tempdir) = load_test_table("v2-checkpoints-json-with-sidecars")?;
+
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
+
+        let scan = snapshot
+            .scan_builder()
+            .with_correlation_id("scan-corr-xyz")
+            .build()?;
+        let mut sequential = scan.parallel_scan_metadata(engine.clone())?;
+        for sm in sequential.by_ref() {
+            sm?;
+        }
+        let AfterSequentialScanMetadata::Parallel { state, files } = sequential.finish()? else {
+            panic!("table with sidecars should require a parallel phase");
+        };
+        let state = if with_serde {
+            Arc::new(ParallelState::from_bytes(
+                engine.as_ref(),
+                &state.into_bytes()?,
+            )?)
+        } else {
+            Arc::new(*state)
+        };
+        let mut parallel = ParallelScanMetadata::try_new(engine.clone(), state.clone(), files)?;
+        for sm in parallel.by_ref() {
+            sm?;
+        }
+        state.log_metrics();
+
+        let correlation_for = |phase: ScanType| {
+            reporter.events().into_iter().find_map(|e| match e {
+                MetricEvent::ScanMetadataCompleted(s) if s.scan_type == phase => {
+                    Some(s.correlation_id)
+                }
+                _ => None,
+            })
+        };
+        assert_eq!(
+            correlation_for(ScanType::SequentialPhase)
+                .expect("expected a sequential-phase event")
+                .as_deref(),
+            Some("scan-corr-xyz"),
+        );
+        assert_eq!(
+            correlation_for(ScanType::ParallelPhase)
+                .expect("expected a parallel-phase event")
+                .as_deref(),
+            expected_parallel,
+        );
         Ok(())
     }
 
@@ -573,8 +644,8 @@ mod tests {
         );
 
         // Verify timing metrics are present and parseable (values may be 0 for fast operations)
-        let _dedup_time = extract_metric(sequential_logs, "dedup_visitor_time_ms");
-        let _predicate_eval_time = extract_metric(sequential_logs, "predicate_eval_time_ms");
+        let _dedup_time = extract_metric(sequential_logs, "dedup_visitor_time_ns");
+        let _predicate_eval_time = extract_metric(sequential_logs, "predicate_eval_time_ns");
 
         // Verify Parallel metrics if expected
         if let Some(expected) = parallel_expected {
@@ -598,8 +669,8 @@ mod tests {
                 total_predicate_filtered += extract_metric(remaining, "predicate_filtered");
 
                 // Verify timing metrics are present and parseable in parallel phase
-                let _dedup_time = extract_metric(remaining, "dedup_visitor_time_ms");
-                let _predicate_eval_time = extract_metric(remaining, "predicate_eval_time_ms");
+                let _dedup_time = extract_metric(remaining, "dedup_visitor_time_ns");
+                let _predicate_eval_time = extract_metric(remaining, "predicate_eval_time_ns");
 
                 search_start = absolute_pos + 1;
             }
@@ -676,8 +747,8 @@ mod tests {
         // Tests data skipping filtering based on column stats (min/max values)
         path: "v2-checkpoints-json-with-sidecars",
         predicate: Some({
-            use crate::expressions::{column_expr, Expression as Expr};
-            Arc::new(Expr::gt(column_expr!("id"), Expr::literal(20i64)))
+            use crate::expressions::{col, lit, Expression as Expr};
+            Arc::new(Expr::gt(col!("id"), lit(20i64)))
         }),
         expected_sequential_metrics: ExpectedMetrics {
             add_files_seen: 0,
@@ -705,8 +776,8 @@ mod tests {
         // partition values -- those are correctly filtered since is_add=true for them.
         path: "basic_partitioned",
         predicate: Some({
-            use crate::expressions::{column_expr, Expression as Expr};
-            Arc::new(Expr::eq(column_expr!("letter"), Expr::literal("a")))
+            use crate::expressions::{col, lit, Expression as Expr};
+            Arc::new(Expr::eq(col!("letter"), lit("a")))
         }),
         expected_sequential_metrics: ExpectedMetrics {
             // Columnar filter prunes all 4 non-matching files (b, c, e, null) before the
@@ -889,7 +960,7 @@ mod tests {
         let scan = snapshot
             .clone()
             .scan_builder()
-            .with_skip_stats(true)
+            .with_stats(StatsOptions::none())
             .build()?;
         let mut single_node_iter = scan.scan_metadata(engine.as_ref())?;
         let mut expected_paths = single_node_iter.try_fold(Vec::new(), |acc, metadata_res| {
@@ -904,7 +975,10 @@ mod tests {
         expected_paths.sort();
 
         // Run parallel workflow with skip_stats=true
-        let scan = snapshot.scan_builder().with_skip_stats(true).build()?;
+        let scan = snapshot
+            .scan_builder()
+            .with_stats(StatsOptions::none())
+            .build()?;
         let mut sequential = scan.parallel_scan_metadata(engine.clone())?;
 
         // Verify stats is None in sequential results and collect paths
@@ -971,7 +1045,7 @@ mod tests {
         let scan_events: Vec<&ScanType> = events
             .iter()
             .filter_map(|e| match e {
-                MetricEvent::ScanMetadataCompleted { scan_type, .. } => Some(scan_type),
+                MetricEvent::ScanMetadataCompleted(s) => Some(&s.scan_type),
                 _ => None,
             })
             .collect();
@@ -1008,11 +1082,11 @@ mod tests {
             .events()
             .into_iter()
             .find_map(|e| match e {
-                MetricEvent::ScanMetadataCompleted {
-                    operation_id,
-                    scan_type: ScanType::SequentialPhase,
-                    ..
-                } => Some(operation_id),
+                MetricEvent::ScanMetadataCompleted(s)
+                    if s.scan_type == ScanType::SequentialPhase =>
+                {
+                    Some(s.operation_id)
+                }
                 _ => None,
             })
             .expect("expected SequentialPhase ScanMetadataCompleted event after finish()");
@@ -1028,11 +1102,9 @@ mod tests {
             .events()
             .into_iter()
             .find_map(|e| match e {
-                MetricEvent::ScanMetadataCompleted {
-                    operation_id,
-                    scan_type: ScanType::ParallelPhase,
-                    ..
-                } => Some(operation_id),
+                MetricEvent::ScanMetadataCompleted(s) if s.scan_type == ScanType::ParallelPhase => {
+                    Some(s.operation_id)
+                }
                 _ => None,
             })
             .expect("expected ParallelPhase ScanMetadataCompleted event after log_metrics()");

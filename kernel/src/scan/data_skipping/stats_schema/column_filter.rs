@@ -137,7 +137,7 @@ impl<'col> StatsColumnFilter<'col> {
                     continue;
                 }
                 // Verify the required column exists in schema before adding
-                if schema.walk_column_fields(col).is_ok() {
+                if schema.field_at(col).is_ok() {
                     tracing::warn!(
                         "Required column '{}' exceeds dataSkippingNumIndexedCols limit; \
                          adding anyway",
@@ -245,6 +245,7 @@ impl<'col> StatsColumnFilter<'col> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::expressions::column_name;
     use crate::schema::StructType;
     use crate::table_properties::TableProperties;
 
@@ -358,7 +359,7 @@ mod tests {
         let props = make_props_with_num_cols(2);
 
         // Required column is deeply nested: user.address.city
-        let required_cols = vec![ColumnName::new(["user", "address", "city"])];
+        let required_cols = vec![column_name!("user.address.city")];
 
         let address_struct = StructType::new_unchecked([
             StructField::nullable("street", DataType::STRING),
@@ -367,7 +368,7 @@ mod tests {
         ]);
         let user_struct = StructType::new_unchecked([
             StructField::nullable("name", DataType::STRING),
-            StructField::nullable("address", DataType::Struct(Box::new(address_struct))),
+            StructField::nullable("address", address_struct),
         ]);
         let other_struct = StructType::new_unchecked([
             StructField::nullable("foo", DataType::STRING),
@@ -377,8 +378,8 @@ mod tests {
         let schema = StructType::new_unchecked([
             StructField::nullable("id", DataType::LONG),
             StructField::nullable("name", DataType::STRING),
-            StructField::nullable("user", DataType::Struct(Box::new(user_struct))),
-            StructField::nullable("other", DataType::Struct(Box::new(other_struct))),
+            StructField::nullable("user", user_struct),
+            StructField::nullable("other", other_struct),
             StructField::nullable("extra1", DataType::STRING),
             StructField::nullable("extra2", DataType::STRING),
         ]);
@@ -389,9 +390,9 @@ mod tests {
         assert_eq!(
             columns,
             vec![
-                ColumnName::new(["id"]),
-                ColumnName::new(["name"]),
-                ColumnName::new(["user", "address", "city"]),
+                column_name!("id"),
+                column_name!("name"),
+                column_name!("user.address.city"),
             ]
         );
     }
@@ -400,15 +401,12 @@ mod tests {
     fn test_required_column_not_in_schema() {
         // Required column that doesn't exist in schema should be silently ignored
         let props = make_props_with_num_cols(2);
-        let required_cols = vec![ColumnName::new(["nonexistent", "column"])];
+        let required_cols = vec![column_name!("nonexistent.column")];
         let schema = abc_schema();
 
         let columns = collect_stats_columns(&props, Some(&required_cols), &schema);
 
         // Should only include normal columns, required column not found
-        assert_eq!(
-            columns,
-            vec![ColumnName::new(["a"]), ColumnName::new(["b"]),]
-        );
+        assert_eq!(columns, vec![column_name!("a"), column_name!("b"),]);
     }
 }

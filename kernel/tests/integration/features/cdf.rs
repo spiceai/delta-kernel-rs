@@ -1,13 +1,21 @@
 use std::error;
+use std::sync::Arc;
 
 use delta_kernel::arrow::array::RecordBatch;
 use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
+use delta_kernel::arrow::util::pretty::pretty_format_batches;
 use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
+use delta_kernel::expressions::{col, lit, Predicate as Pred};
+use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::table_changes::TableChanges;
 use delta_kernel::{DeltaResult, Error, PredicateRef, Version};
 use itertools::Itertools;
-use test_utils::load_test_data;
+use test_utils::{
+    add_commit, create_default_engine, create_default_engine_with_batch, create_table,
+    engine_store_setup, load_test_data,
+};
+use url::Url;
 
 fn read_cdf_for_table(
     test_name: impl AsRef<str>,
@@ -15,10 +23,20 @@ fn read_cdf_for_table(
     end_version: impl Into<Option<Version>>,
     predicate: impl Into<Option<PredicateRef>>,
 ) -> DeltaResult<Vec<RecordBatch>> {
+    read_cdf_for_table_with_batch_size(test_name, start_version, end_version, predicate, None)
+}
+
+fn read_cdf_for_table_with_batch_size(
+    test_name: impl AsRef<str>,
+    start_version: Version,
+    end_version: impl Into<Option<Version>>,
+    predicate: impl Into<Option<PredicateRef>>,
+    batch_size: Option<usize>,
+) -> DeltaResult<Vec<RecordBatch>> {
     let test_dir = load_test_data("tests/data", test_name.as_ref()).unwrap();
     let test_path = test_dir.path().join(test_name.as_ref());
     let test_path = delta_kernel::try_parse_uri(test_path.to_str().expect("table path to string"))?;
-    let engine = test_utils::create_default_engine(&test_path)?;
+    let engine = create_default_engine_with_batch(&test_path, batch_size)?;
     let table_changes = TableChanges::try_new(
         test_path,
         engine.as_ref(),
@@ -47,7 +65,7 @@ fn read_cdf_for_table(
         .map(|data| -> DeltaResult<_> {
             let record_batch = data?.try_into_record_batch()?;
             // Verify that the arrow record batches match the expected schema
-            assert!(record_batch.schema().as_ref() == &scan_schema_as_arrow);
+            assert_eq!(record_batch.schema().as_ref(), &scan_schema_as_arrow);
             Ok(record_batch)
         })
         .try_collect()?;
@@ -97,6 +115,31 @@ fn cdf_with_deletion_vector() -> Result<(), Box<dyn error::Error>> {
     ];
     sort_lines!(expected);
     assert_batches_sorted_eq!(expected, &batches);
+    Ok(())
+}
+
+#[test]
+fn cdf_with_deletion_vector_is_batch_size_invariant() -> Result<(), Box<dyn error::Error>> {
+    let expected = read_cdf_for_table("cdf-table-with-dv", 0, None, None)?;
+    for batch_size in [1usize, 2, 3, 4, 7] {
+        let actual = read_cdf_for_table_with_batch_size(
+            "cdf-table-with-dv",
+            0,
+            None,
+            None,
+            Some(batch_size),
+        )?;
+        let expected_rows: usize = expected.iter().map(RecordBatch::num_rows).sum();
+        let actual_rows: usize = actual.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(
+            actual_rows, expected_rows,
+            "row count changed at batch_size={batch_size}: got {actual_rows}, want {expected_rows}"
+        );
+        let formatted = pretty_format_batches(&expected)?.to_string();
+        let mut expected_lines: Vec<&str> = formatted.trim().lines().collect();
+        sort_lines!(expected_lines);
+        assert_batches_sorted_eq!(expected_lines, &actual);
+    }
     Ok(())
 }
 
@@ -577,6 +620,70 @@ fn cdf_with_column_mapping_name_mode() -> Result<(), Box<dyn error::Error>> {
     sort_lines!(expected);
     assert_batches_sorted_eq!(expected, &batches);
 
+    Ok(())
+}
+
+/// CDF over a commit whose Add carries an extended-year ISO 8601 timestamp in `stats`.
+/// The bad `EventTime` cell becomes a per-cell NULL while sibling `UserId` stats survive;
+/// the `UserId > 1000` predicate then prunes the file inside the `DataSkippingFilter` in
+/// `table_changes` log-replay, so `execute()` never tries to read the phantom parquet
+/// file and returns zero rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cdf_per_cell_null_on_malformed_stats() -> Result<(), Box<dyn error::Error>> {
+    let schema = Arc::new(
+        StructType::try_new(vec![
+            StructField::nullable("EventTime", DataType::TIMESTAMP),
+            StructField::nullable("UserId", DataType::LONG),
+        ])
+        .unwrap(),
+    );
+
+    let tmp_dir = tempfile::tempdir()?;
+    let tmp_url = Url::from_directory_path(tmp_dir.path()).unwrap();
+    let (store, _engine, table_url) = engine_store_setup("cdf_per_cell_null", Some(&tmp_url));
+
+    create_table(
+        store.clone(),
+        table_url.clone(),
+        schema.clone(),
+        &[],
+        true,
+        vec![],
+        vec!["changeDataFeed"],
+    )
+    .await?;
+
+    let stats = r#"{"numRecords":20,"minValues":{"EventTime":"+48690-07-02T22:50:38.211Z","UserId":5},"maxValues":{"EventTime":"+48690-07-02T22:50:38.211Z","UserId":200},"nullCount":{"EventTime":0,"UserId":0},"tightBounds":true}"#;
+    let stats_escaped = serde_json::Value::String(stats.to_string()).to_string();
+    let commit_info =
+        r#"{"commitInfo":{"timestamp":1700000000000,"operation":"WRITE","version":1}}"#;
+    let add = format!(
+        r#"{{"add":{{"path":"phantom_file.parquet","size":1024,"modificationTime":1700000000000,"dataChange":true,"partitionValues":{{}},"stats":{stats_escaped}}}}}"#
+    );
+    let commit_body = format!("{commit_info}\n{add}");
+    add_commit(table_url.as_str(), store.as_ref(), 1, commit_body).await?;
+
+    let engine = create_default_engine(&table_url)?;
+    let table_changes = TableChanges::try_new(table_url.clone(), engine.as_ref(), 1, Some(1))?;
+
+    let predicate: PredicateRef = Arc::new(Pred::gt(col!("UserId"), lit(1000i64)));
+    let scan = table_changes
+        .into_scan_builder()
+        .with_predicate(predicate)
+        .build()?;
+
+    // execute() must succeed and yield zero rows. The phantom file would crash an actual
+    // parquet read; the test passing means the per-cell NULL kept UserId stats valid and
+    // the predicate pruned the file before reading.
+    let batches: Vec<RecordBatch> = scan
+        .execute(engine)?
+        .map(|data| -> DeltaResult<_> { data?.try_into_record_batch() })
+        .try_collect()?;
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        total_rows, 0,
+        "predicate should have pruned the phantom file"
+    );
     Ok(())
 }
 

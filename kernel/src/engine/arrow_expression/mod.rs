@@ -1,8 +1,8 @@
 //! Expression handling based on arrow-rs compute kernels.
 use std::sync::Arc;
 
-use apply_schema::{apply_schema, apply_schema_to};
-use evaluate_expression::{evaluate_expression, evaluate_predicate, extract_column};
+pub(crate) use evaluate_expression::extract_column;
+use evaluate_expression::{evaluate_expression, evaluate_predicate};
 use itertools::Itertools;
 use tracing::debug;
 
@@ -12,13 +12,13 @@ use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
 };
 use crate::engine::arrow_data::{extract_record_batch, ArrowEngineData};
+use crate::engine::arrow_utils::apply_schema::{apply_schema, apply_schema_to};
 use crate::error::{DeltaResult, Error};
 use crate::expressions::{ArrayData, Expression, ExpressionRef, PredicateRef, Scalar};
 use crate::schema::{DataType, PrimitiveType, SchemaRef};
 use crate::utils::require;
 use crate::{EngineData, EvaluationHandler, ExpressionEvaluator, PredicateEvaluator};
 
-mod apply_schema;
 pub mod evaluate_expression;
 pub mod opaque;
 
@@ -100,6 +100,8 @@ impl Scalar {
                 // timezone was already set at builder construction time
                 append_val_n_as!(array::TimestampMicrosecondBuilder, *val)
             }
+            IntervalYearMonth(val) => append_val_n_as!(array::Int32Builder, *val),
+            IntervalDayTime(val) => append_val_n_as!(array::Int64Builder, *val),
             Date(val) => append_val_n_as!(array::Date32Builder, *val),
             Binary(val) => append_val_as!(array::BinaryBuilder, val),
             // precision and scale were already set at builder construction time
@@ -208,10 +210,18 @@ impl Scalar {
                     builder.append(false)?;
                 }
             }
+            DataType::VOID => append_nulls_as!(array::NullBuilder),
             DataType::Variant(_) => {
                 return Err(Error::unsupported(
                     "Variant is not supported as scalar yet.",
                 ));
+            }
+            // Intervals are exposed as their physical integer (i32 months / i64 microseconds).
+            DataType::INTERVAL_YEAR_MONTH => append_nulls_as!(array::Int32Builder),
+            DataType::INTERVAL_DAY_TIME => append_nulls_as!(array::Int64Builder),
+            #[cfg(feature = "geo-type-in-dev")]
+            DataType::Primitive(PrimitiveType::Geometry(_) | PrimitiveType::Geography(_)) => {
+                return Err(Error::unsupported("Geo is not supported as scalar yet."));
             }
         }
         Ok(())
@@ -349,11 +359,11 @@ impl ExpressionEvaluator for DefaultExpressionEvaluator {
         //     )));
         // };
         let batch = match (self.expression.as_ref(), &self.output_type) {
-            (Expression::Transform(transform), DataType::Struct(_)) if transform.is_identity() => {
-                // Empty transform optimization: Skip expression evaluation and directly apply the
+            (Expression::StructPatch(patch), DataType::Struct(_)) if patch.is_empty() => {
+                // Empty patch optimization: Skip expression evaluation and directly apply the
                 // output schema to the input RecordBatch. This is used to cheaply apply a new
                 // output schema to existing data without changing it, e.g. for column mapping.
-                let array = match transform.input_path() {
+                let array = match patch.input_path() {
                     None => Arc::new(StructArray::from(batch.clone())),
                     Some(path) => extract_column(batch, path)?,
                 };

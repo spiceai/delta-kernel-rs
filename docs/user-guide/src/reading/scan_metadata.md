@@ -246,6 +246,90 @@ If the scan has no predicate, this returns `None`.
 > physical predicate, and the `ScanFile` data together. Workers need all four to read files
 > correctly.
 
+## Typed partition values
+
+Kernel reads each file's partition values from the Delta log and exposes them on its
+`ScanFile` as a raw string map. Kernel's `transform_to_logical` could materialize them as
+typed columns. If your connector assembles output rows itself instead of using that transform,
+it parses the string map per file.
+
+To have Kernel hand you the typed values directly, opt in with `with_partition_values`:
+
+```rust,no_run
+# extern crate delta_kernel;
+# extern crate delta_kernel_default_engine;
+# use std::sync::Arc;
+# use delta_kernel_default_engine::DefaultEngine;
+# use delta_kernel_default_engine::storage::store_from_url;
+# use delta_kernel::scan::PartitionValuesOptions;
+# use delta_kernel::{DeltaResult, Snapshot};
+# fn example() -> DeltaResult<()> {
+# let url = delta_kernel::try_parse_uri("/tmp/table")?;
+# let store = store_from_url(&url)?;
+# let engine = DefaultEngine::builder(store).build();
+# let snapshot = Snapshot::builder_for(url).build(&engine)?;
+let scan = snapshot
+    .scan_builder()
+    .with_partition_values(PartitionValuesOptions::with_struct())
+    .build()?;
+# Ok(())
+# }
+```
+
+Scan metadata output then gains a top-level `partitionValues_parsed` column with one typed,
+nullable field per partition column (by physical name). You read it as a typed column instead
+of parsing the string map per file. The raw string map is still present, so this option only
+adds the typed column.
+
+> [!TIP]
+> When the checkpoint already stores typed partition values, Kernel reads that column directly
+> and skips parsing entirely.
+
+## Cancelling a scan
+
+Log replay for a large table can read many commit and checkpoint files before it yields a single
+`ScanMetadata`. If the request driving the scan goes away — a cancelled query, a dropped
+connection — you can tell Kernel to stop instead of reading to the end. Attach a
+`CancellationToken` to the scan with `with_cancellation_token`:
+
+```rust,ignore
+use std::sync::Arc;
+use delta_kernel::CancellationTokenRef;
+
+// `token` is your connector's cancellation handle, implementing `CancellationToken`.
+// It is commonly a thin wrapper over your runtime's primitive (e.g.
+// `tokio_util::sync::CancellationToken`). See "Cancellation-aware reads" in
+// Implementing the Engine Trait for how to build one.
+let token: CancellationTokenRef = my_request_token();
+
+let scan = snapshot
+    .scan_builder()
+    .with_cancellation_token(token)
+    .build()?;
+
+for metadata in scan.scan_metadata(engine)? {
+    let metadata = metadata?; // yields Err(Error::Cancelled) once the token fires
+    // ... process the batch ...
+}
+```
+
+Cancellation is cooperative and always visible as an error, so a cancelled scan can never be
+mistaken for a complete one:
+
+- Kernel polls the token at each action-batch boundary, so replay stops between reads even if the
+  engine ignores the token.
+- If the engine implements the [cancellation-aware read
+  variants](../connector/implementing_engine.md#cancellation-aware-reads), an I/O already in flight
+  can be interrupted rather than running to completion — this is what lets a scan stuck on one slow
+  file read stop promptly.
+- Either way, the outcome surfaces as `Error::Cancelled`: either returned directly from
+  `scan_metadata()` (when the token is already cancelled before replay begins) or as the terminal
+  item of its iterator. It is never a short or empty result.
+
+Without a token, the scan is not cancellable and runs to completion as usual. Cancellation applies
+to the lazy `scan_metadata()` path; [`parallel_scan_metadata()`](./parallel_scan_metadata.md) does
+not support it and rejects a token rather than silently ignoring it.
+
 ## What's next
 
 - [Column Selection](./column_selection.md): projecting specific columns
