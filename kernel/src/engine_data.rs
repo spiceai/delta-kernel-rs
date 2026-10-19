@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::ops::Range;
 
+use derive_more::Constructor;
 use tracing::debug;
 
 use crate::actions::visitors::SelectionVectorVisitor;
@@ -126,16 +127,13 @@ pub trait StringArrayAccessor {
 /// A pre-resolved view into a single row's list of strings. The string array type is resolved
 /// once at construction, so subsequent element accesses use virtual dispatch rather than
 /// repeated downcasting.
+#[derive(Constructor)]
 pub struct ListItem<'a> {
     values: &'a dyn StringArrayAccessor,
     offsets: Range<usize>,
 }
 
 impl<'a> ListItem<'a> {
-    pub fn new(values: &'a dyn StringArrayAccessor, offsets: Range<usize>) -> ListItem<'a> {
-        ListItem { values, offsets }
-    }
-
     pub fn len(&self) -> usize {
         self.offsets.len()
     }
@@ -167,6 +165,7 @@ impl<'a> ListItem<'a> {
 /// materialize the map using [`MapItem::get`].
 ///
 /// [`materialize`]: MapItem::materialize
+#[derive(Constructor)]
 pub struct MapItem<'a> {
     keys: &'a dyn StringArrayAccessor,
     values: &'a dyn StringArrayAccessor,
@@ -174,18 +173,6 @@ pub struct MapItem<'a> {
 }
 
 impl<'a> MapItem<'a> {
-    pub fn new(
-        keys: &'a dyn StringArrayAccessor,
-        values: &'a dyn StringArrayAccessor,
-        offsets: Range<usize>,
-    ) -> MapItem<'a> {
-        MapItem {
-            keys,
-            values,
-            offsets,
-        }
-    }
-
     pub fn get(&self, key: &str) -> Option<&'a str> {
         let idx = self
             .offsets
@@ -216,6 +203,39 @@ impl<'a> MapItem<'a> {
     }
 }
 
+/// Read access to the element structs of an array-of-structs column, abstracting over how the
+/// engine stores them. Backs [`StructList`], mirroring how [`StringArrayAccessor`] backs
+/// [`ListItem`]. Engines implement this for their list column types.
+pub trait StructListAccessor {
+    /// Visits the element structs of the list at `row_index`, one visited row per element.
+    /// Implementations must reject, not skip, a null element struct.
+    fn visit_elems_of_row(
+        &self,
+        row_index: usize,
+        column_names: &[ColumnName],
+        visitor: &mut dyn RowVisitor,
+    ) -> DeltaResult<()>;
+}
+
+/// A handle to a single row's array of element structs. Unlike [`ListItem`], which materializes
+/// strings, the elements are structs visited in place by a nested [`RowVisitor`].
+#[derive(Constructor)]
+pub struct StructList<'a> {
+    list: &'a dyn StructListAccessor,
+    row_index: usize,
+}
+
+impl<'a> StructList<'a> {
+    /// Drives a nested [`RowVisitor`] over this row's element structs, one visited row per
+    /// element. The visitor's columns resolve against the element struct's schema, not the outer
+    /// row's. Errors if any element struct in this row is null.
+    pub fn visit_with(&self, visitor: &mut dyn RowVisitor) -> DeltaResult<()> {
+        let column_names = visitor.selected_column_names_and_types().0;
+        self.list
+            .visit_elems_of_row(self.row_index, column_names, visitor)
+    }
+}
+
 macro_rules! impl_default_get {
     ( $(($name: ident, $typ: ty)), * ) => {
         $(
@@ -232,6 +252,8 @@ macro_rules! impl_default_get {
 /// default all these methods will return an `Error` that an incorrect type has been asked
 /// for. Therefore, for each "data container" an Engine has, it is only necessary to implement the
 /// `get_x` method for the type it holds.
+///
+/// All methods return `Ok(None)` when the row's value is null.
 pub trait GetData<'a> {
     impl_default_get!(
         (get_bool, bool),
@@ -247,7 +269,8 @@ pub trait GetData<'a> {
         (get_str, &'a str),
         (get_binary, &'a [u8]),
         (get_list, ListItem<'a>),
-        (get_map, MapItem<'a>)
+        (get_map, MapItem<'a>),
+        (get_struct_list, StructList<'a>)
     );
 }
 
@@ -276,7 +299,8 @@ impl<'a> GetData<'a> for () {
         (get_str, &'a str),
         (get_binary, &'a [u8]),
         (get_list, ListItem<'a>),
-        (get_map, MapItem<'a>)
+        (get_map, MapItem<'a>),
+        (get_struct_list, StructList<'a>)
     );
 }
 
@@ -520,6 +544,9 @@ pub trait EngineData: AsAny {
     /// Visits a subset of leaf columns in each row of this data, passing a `GetData` item for each
     /// requested column to the visitor's `visit` method (along with the number of rows of data to
     /// be visited).
+    ///
+    /// Implementations must invoke [`RowVisitor::visit`] exactly once. `row_count` must equal
+    /// [`EngineData::len`], and every getter must support the same `0..row_count` row range.
     fn visit_rows(
         &self,
         column_names: &[ColumnName],

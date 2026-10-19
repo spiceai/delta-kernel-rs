@@ -3,13 +3,15 @@
 //! [`Transaction`]: super::Transaction
 
 // TODO(#2869): Add the remaining write-side validations:
-// - Required fields for `txn.remove_files_metadata`
 // - No duplicate (path, DvId) in `txn.add_files_metadata`, `txn.remove_files_metadata`,
 //   `txn.dv_matched_files`
 
 mod addfile;
 mod dv;
+mod removefile;
 mod utils;
+
+use derive_more::Constructor;
 
 use crate::engine_data::{
     FilteredEngineData, FilteredRowVisitor, GetData, RowIndexIterator, RowVisitor,
@@ -27,22 +29,13 @@ pub(crate) trait Validation {
 ///
 /// Each instance uses one column projection and applies its configured validations to every staged
 /// row. Every [`Validation`] sees the full getter list and reads the columns it needs.
+#[derive(Constructor)]
 pub(crate) struct StagedDataValidator {
     columns_and_types: &'static ColumnNamesAndTypes,
     validations: Vec<Box<dyn Validation>>,
 }
 
 impl StagedDataValidator {
-    pub(crate) fn new(
-        columns_and_types: &'static ColumnNamesAndTypes,
-        validations: Vec<Box<dyn Validation>>,
-    ) -> Self {
-        Self {
-            columns_and_types,
-            validations,
-        }
-    }
-
     /// Run every validation against each batch. Returns the first validation error encountered.
     pub(crate) fn validate(mut self, batches: &[Box<dyn EngineData>]) -> DeltaResult<()> {
         for batch in batches {
@@ -61,7 +54,7 @@ impl StagedDataValidator {
 
     fn validate_rows<'a>(
         &mut self,
-        rows: impl Iterator<Item = usize>,
+        rows: impl IntoIterator<Item = usize>,
         getters: &[&'a dyn GetData<'a>],
     ) -> DeltaResult<()> {
         for row in rows {
