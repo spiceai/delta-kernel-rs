@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
+use delta_kernel_derive::internal_api;
 use roaring::RoaringTreemap;
 use serde::Deserialize;
 use tracing::warn;
@@ -48,6 +49,9 @@ impl DvInfo {
         self.deletion_vector.is_some()
     }
 
+    /// Reads this file's deletion vector as a bitmap of deleted row indexes, or `None` when the
+    /// file has no deletion vector.
+    #[internal_api]
     pub(crate) fn get_treemap(
         &self,
         engine: &dyn Engine,

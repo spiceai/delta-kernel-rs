@@ -3,12 +3,17 @@
 `spiceai-0.27` is Spice's fork line for upstream Delta Kernel 0.27.x. It is pristine upstream
 [`v0.27.1`](https://github.com/delta-io/delta-kernel-rs/tree/v0.27.1) (commit
 `728aeb966be250d0520df7aad873818e809e77f2`, tagged `upstream-v0.27.1` in this repo) merged into
-the previous fork line (`spiceai-0.23.0`). Apart from this file and the CI-only changes below,
-the tree is identical to upstream v0.27.1.
+the previous fork line (`spiceai-0.23.0`). Apart from this file, the CI-only changes and the code
+patch below, the tree is identical to upstream v0.27.1.
 
 ## Patch status
 
-**No Spice-specific code patches are required on top of upstream v0.27.1.**
+One Spice code patch sits on top of upstream v0.27.1:
+
+- `DvInfo::get_treemap` (`kernel/src/scan/state.rs`) is public under the `internal-api` feature.
+  Spice reads a file's deletion vector as a compact `RoaringTreemap` and builds Parquet row
+  selections from it. `get_selection_vector` allocates a `Vec<bool>` sized by the largest deleted
+  row index, and `get_row_indexes` allocates one `u64` per deleted row.
 
 Both Spice patches from the earlier 0.18.x fork line remain upstreamed and are present in
 v0.27.1:
